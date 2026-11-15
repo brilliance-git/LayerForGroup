@@ -19,10 +19,12 @@
 -- Data: WTF/Account/<acct>/SavedVariables/LayerProbe.lua. /probe for commands, /probe report for answers.
 local ADDON = ...
 local PREFIX, CHANNEL = "LProbe", "LayerProbeNet"
+local RPREFIX = "LP" -- results whispered by friends WITHOUT the addon (see /probe macros); short to fit a 255-char /run
 local db
 local myName, myRealm, layer, layerMap = nil, nil, nil, nil
 local pending -- the search in flight: { how, at, gap }
 local showSnapshot -- defined with the snapshot window below
+local onRemote -- defined with the macros below
 local lastSearchAt
 
 ---------------------------------------------------------------------------
@@ -302,6 +304,7 @@ local function onAddonMessage(prefix, msg, dist, sender)
     db.secret.messages = (db.secret.messages or 0) + 1
     return
   end
+  if prefix == RPREFIX and onRemote then return onRemote(msg, sender) end
   if prefix ~= PREFIX then return end
   local whisperName = normName(sender)
   if not whisperName or whisperName:lower() == (myName or ""):lower() then return end
@@ -771,6 +774,12 @@ local function report()
   for f, n in pairs(sec) do secList[#secList + 1] = f .. " x" .. n end
   out(("LAYER Q13 lockdown: %d scans in instance/lockdown; secret fields: %s; secret addon messages: %d"):format(lockScans,
     #secList > 0 and table.concat(secList, ", ") or "none", db.secret.messages or 0))
+  for who, rs in pairs(db.remote) do
+    local r = rs.result
+    out(("REMOTE %s (%s, %s): %s"):format(who, rs.realm, tostring(rs.target), type(r) == "table"
+      and ("%d shared of theirs %d / yours %d, merged %d"):format(r.shared, r.theirs, r.mine, r.union)
+      or tostring(r or ("waiting: " .. count(rs.ids) .. "/" .. tostring(rs.n) .. " ids"))))
+  end
   out("Full data: WTF/Account/<account>/SavedVariables/LayerProbe.lua (written on /reload or logout)")
 end
 
@@ -796,6 +805,7 @@ end
 -- different realms are compared with tools/compare_snapshots.py in the repo.
 ---------------------------------------------------------------------------
 local snapButton, snapFrame
+local snapshot -- defined below
 
 local function remaining(mc, role)
   if type(mc) ~= "table" then return 0 end
@@ -862,19 +872,94 @@ local function makeSnapFrame()
   snapFrame.edit = edit
 end
 
-showSnapshot = function(scan)
+local function showText(text)
   if not snapFrame then makeSnapFrame() end
-  local text = snapshotText(scan)
-  db.lastSnapshot = text
   snapFrame.edit.text = text
   snapFrame.edit:SetText(text)
   snapFrame:Show()
   snapFrame.edit:SetFocus()
   snapFrame.edit:HighlightText()
+end
+
+showSnapshot = function(scan)
+  local text = snapshotText(scan)
+  db.lastSnapshot = text
+  showText(text)
   out(("snapshot ready: %d listings for %s"):format(#scan.results, db.target and db.target.query or "the category"))
 end
 
-local function snapshot(arg)
+---------------------------------------------------------------------------
+-- Macros: friends WITHOUT the addon run two chat lines; the second sends their tool's party ids
+-- to you as hidden addon messages ("LP" prefix: "R<count>^id,id,..."). Your probe compares them
+-- with your own snapshot of the same dungeon.
+---------------------------------------------------------------------------
+local function macroLines()
+  local t = db.target
+  local ids = {}
+  for _, id in ipairs(t.ids) do ids[#ids + 1] = tostring(id) end
+  local l1 = ("/run C_LFGList.Search(%d,0,0,nil,false,nil,{%s})"):format(t.cat, table.concat(ids, ","))
+  local l2 = ('/run local g,s,_,r=C_LFGList.GetSearchResultInfo,"",C_LFGList.GetSearchResults()for k,i in ipairs(r)do '
+    .. 's=s..g(i).partyGUID:sub(7)..","if#s>200 or k==#r then C_ChatInfo.SendAddonMessage("%s","R"..#r.."^"..s,'
+    .. '"WHISPER","%s")s=""end end'):format(RPREFIX, myName)
+  return l1, l2
+end
+
+local function macros(arg)
+  if arg ~= "" then setDungeon(arg) end
+  if not db.target then return out("pick a dungeon: /probe macros <name>   (/probe dungeon lists them)") end
+  local l1, l2 = macroLines()
+  local text = table.concat({
+    "LFG realm test for " .. table.concat(db.target.names, " + ") .. " - no addon needed, takes 10 seconds:",
+    "1) Paste this into your chat box and press Enter (it searches the LFG tool):",
+    l1,
+    "2) Wait 3 seconds, then paste this and press Enter (it sends the results to " .. myName .. ", invisibly):",
+    l2,
+    "Must be the same faction as " .. myName .. ". Nothing shows in chat and nothing is installed.",
+  }, "\n")
+  showText(text)
+  if #l1 > 255 or #l2 > 255 then
+    out(("|cffff5555warning:|r a line is %d characters; WoW's chat box takes 255. Pick a dungeon with fewer activities."):format(math.max(#l1, #l2)))
+  end
+  out("copy the text and send it to your friends. Then click |cff33ff99Take snapshot|r yourself at the same time:")
+  snapshot("")
+end
+
+onRemote = function(msg, sender)
+  local n, ids = msg:match("^R(%d+)%^(.*)$")
+  local who = not isSecret(sender) and type(sender) == "string" and sender or nil
+  if not n or not who then return end
+  local realm = who:match("%-([^%-]+)$") or myRealm
+  local rs = db.remote[who]
+  if not rs or now() - rs.t > 120 then
+    rs = { by = who, realm = realm, n = tonumber(n), t = now(), ids = {}, target = db.target and db.target.query }
+    db.remote[who] = rs
+  end
+  for id in ids:gmatch("[^,]+") do rs.ids[id] = true end
+  if count(rs.ids) < rs.n then return end -- more chunks to come
+  -- compare with my latest complete scan, ideally a snapshot, from the last 10 minutes
+  local mine
+  for i = #db.scans, 1, -1 do
+    local sc = db.scans[i]
+    if rs.t - sc.t > 600 then break end
+    if sc.complete then mine = sc break end
+  end
+  if not mine then
+    rs.result = "no own snapshot to compare with"
+    return out(("%s (%s) sent %d listings - click Take snapshot yourself to compare"):format(who, realm, rs.n))
+  end
+  local shared, union = 0, {}
+  for k in pairs(mine.items) do union[(k:gsub("^Party%-", ""))] = true end
+  for k in pairs(rs.ids) do
+    if union[k] then shared = shared + 1 end
+    union[k] = true
+  end
+  local u, m = count(union), count(mine.items)
+  rs.result = { shared = shared, theirs = rs.n, mine = m, union = u, sameRealm = realm == myRealm, myScanT = mine.t }
+  out(("|cff33ff99%s|r (%s): %d listings, %d shared with your %d -> merged list %d (%.1fx yours)%s"):format(who, realm,
+    rs.n, shared, m, u, m > 0 and u / m or 0, realm == myRealm and " [same realm: control]" or ""))
+end
+
+function snapshot(arg)
   if arg ~= "" then setDungeon(arg) end
   if not db.target then return out("pick a dungeon: /probe snapshot <name>   (/probe dungeon lists them)") end
   if not snapButton then
@@ -895,6 +980,7 @@ end
 local HELP = {
   "/probe dungeon [name|all] - list activities, or focus scans on one dungeon",
   "/probe snapshot <dungeon> - one search as copyable text, to compare realms",
+  "/probe macros <dungeon> - two chat lines for friends WITHOUT the addon; results whisper to you",
   "/probe duo First Surname - quick two-player test with a friend (prints the steps)",
   "/probe peer First Surname - add a friend for whisper tests (/probe peer clear)",
   "/probe scan - search now (slash permission)   /probe button - Scan button (click permission)",
@@ -930,6 +1016,7 @@ local function slash(input)
       end
     end)
   elseif cmd == "snapshot" then snapshot(arg)
+  elseif cmd == "macros" then macros(arg)
   elseif cmd == "duo" then
     if arg == "" then return out("usage: /probe duo First Surname   (your friend's full name)") end
     wipe(db.peerTargets)
@@ -972,7 +1059,7 @@ function H.ADDON_LOADED(name)
   if name ~= ADDON then return end
   if not LayerProbeDB or LayerProbeDB.schema ~= 3 then LayerProbeDB = { schema = 3 } end -- older data has another shape
   db = LayerProbeDB
-  for _, k in ipairs({ "log", "scans", "rawSamples", "routes", "crossLayer", "peerScans", "peers", "searchTests",
+  for _, k in ipairs({ "remote", "log", "scans", "rawSamples", "routes", "crossLayer", "peerScans", "peers", "searchTests",
                        "searchLog", "sendResults", "rateSent", "rateReceived", "peerTargets", "lifecycle", "joins",
                        "secret" }) do db[k] = db[k] or {} end
   db.layerStats = db.layerStats or { samples = 0, byMap = {} }
@@ -982,6 +1069,7 @@ function H.ADDON_LOADED(name)
   local version, build, _, iface = GetBuildInfo()
   db.client = { version = version, build = build, interface = iface, realm = GetRealmName() }
   C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
+  C_ChatInfo.RegisterAddonMessagePrefix(RPREFIX)
   if C_LFGList and C_LFGList.Search then
     hooksecurefunc(C_LFGList, "Search", function(cat, _, _, _, _, _, acts)
       local ids = {}

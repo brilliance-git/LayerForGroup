@@ -1,39 +1,72 @@
 # LayerProbe (WoW: Forever)
 
-A fact-finding addon. Before building LayerLink for real, it collects in-game data to confirm or
-rule out each assumption LayerLink relies on. It shows no board and changes nothing. It just
-records data and reports. Built for **WoW: Forever** (interface 16001).
+A fact-finding addon for one goal: **a bigger LFG list for a dungeon**, built by combining what
+LFG-tool users on different layers (and realms) can each see. Before building that, LayerProbe
+measures every assumption in game. It shows no board and changes nothing. It records data and
+answers each question in `/probe report`.
 
-| # | Question | How the probe answers it |
-|---|---|---|
-| Q0 | Does this client have the **LFG API** at all? | Lists every `C_LFGList` function, flags missing ones, and shows which Blizzard LFG addons and frames are loaded. (Another add-on's author reports some classic functions are missing on Forever.) |
-| Q1 | Does the LFG tool only show **your** layer? | Every scan is shared with your peers. Scans from different layers taken within 3 minutes of each other are compared. Under 15% shared leaders means layer-limited (LayerLink is worth it). Over 70% means the tool already shows the whole realm. |
-| Q2 | Which **message routes** reach another layer? | Every message goes out on a custom channel, guild, and whisper to your peers. The receiver logs which route it arrived on and whether the sender's layer differed. (Custom channels are reported **not** to deliver on Forever. This checks it.) |
-| Q3 | What can an addon **read** from a listing? | Saves results, members (level, class, role), activity names, and whether the title/comment are readable, protected tokens or secret values. |
-| Q4 | When can an addon **search**? | Tests a button click, a slash command and a timer, and logs blocked actions and failures. |
-| Q5 | How many **messages** get through? | `/probe burst 20` sends on every route. The send result code per route is logged, and the other player counts what arrived. |
-| Q6 | How do **layers** behave? | Every layer reading and change, by map. Forever's layers are reported to be per zone. |
+## What it answers
 
-Forever specifics: names are "First Surname" (the probe uses your full name), and any value the
-client marks secret is recorded as `<secret>` rather than crashing.
+| Area | # | Question | How |
+|---|---|---|---|
+| Tool | Q0 | Which LFG functions exist? | Inventory of `C_LFGList`, Blizzard LFG addons and frames |
+| | Q1 | Do different layers see different listings? | Your scans vs a peer's scans from another layer within 3 min. Shows % shared and **how many times bigger the merged list is**. |
+| | Q2 | Does the tool show other realms? | Realm part of every leader's name |
+| | Q3 | Does the tool only show your zone? | Leaders' current zone vs yours |
+| | Q4 | What can be read? | Leader, title/comment (readable, protected token, or secret), member counts, level, class, role, zone |
+| | Q5 | When can we search, and how often? | Button, slash and timer, plus the shortest gap between searches that still returns results |
+| | Q6 | How long do listings live? | How long each leader stays listed, churn between scans |
+| | Q7 | **For your dungeon**: how many groups and solo players, and how much the list grows when merged across layers | `/probe dungeon <name>` focuses scans |
+| | Q8 | Can an addon read **your own** listing (to share it automatically)? | Logged whenever you list or delist |
+| Network | Q9 | Which routes deliver, across layers? | Every message goes on custom channel, guild, party and whisper. The receiver records the route. |
+| | Q10 | Can addon users **find each other**? | Joins a channel and reads the member lists of our channel and General |
+| | Q11 | Sustained throughput | `/probe rate 2 60` whispers 2 msgs/s for 60 s. The peer counts what arrived. Result codes (e.g. throttled) are logged. |
+| Layers | Q12 | How do layers behave? | Zone ids per map, and **seconds from joining a group to changing layer** |
+| | Q13 | When does data go secret? | Secret fields per scan with instance and chat-lockdown flags |
 
-## Test session (~15 minutes, two players)
+## Test plan (~30 minutes, two players)
 
-You need **two players on different layers**, same realm and faction, both running the probe.
-Being in the same guild helps because it tests the guild route too.
+You need **two players on different layers**: same realm type and faction, ideally the same guild
+(it tests the guild route too). A friend or a second account works.
 
-1. Both: install `LayerProbe` into `Interface/AddOns` and log in. On login the probe prints your full
-   name and any **missing LFG functions**. Run `/probe api` and screenshot the output.
-2. Both: **target any NPC** so the probe knows your layer. Stand in different zones, or use different
-   layers of the same zone.
-3. Each adds the other: `/probe peer First Surname` (your friend's full name).
-4. Wait about a minute. Look for **"WHISPER reaches another layer"**, "GUILD …" or "CHANNEL …" (answers Q2).
-5. At the same time, both open the LFG tool, pick a category, and hit refresh. Repeat a few times over
-   ~10 minutes (answers Q1 and Q3).
-6. One player: `/probe scan`, then `/probe button` and click it, then `/probe timerscan`. The timer
-   is expected to be blocked (answers Q4).
-7. One player: `/probe burst 20`. The other runs `/probe report` and checks "burst received" (answers Q5).
-8. Both: `/probe report`, then `/reload` to write
-   `WTF/Account/<ACCOUNT>/SavedVariables/LayerProbe.lua`. Send both files for analysis.
+**Setup (both players)**
+1. Install `LayerProbe` into `_forever_/Interface/AddOns` and log in. Note any **missing LFG
+   functions** it prints, then run `/probe api`.
+2. Target or mouse over any NPC so your layer is known. Stay in **different layers** of the same
+   zone, or different zones.
+3. `/probe peer First Surname`, using the other player's full name.
+4. `/probe dungeon` lists every activity. Pick the dungeon you care about, e.g. `/probe dungeon scarlet`.
+   Both players pick the same one.
 
-`/probe reset` wipes the collected data.
+**Tool tests (both, at the same time)**
+
+5. Click `/probe button`'s **Scan** button, or refresh Blizzard's LFG tool. Repeat every minute or
+   so for 10 minutes. Busy times give the best numbers (Q1–Q4, Q6, Q7).
+6. One player: click Scan twice quickly, then `/probe scan`, then `/probe timerscan`. The timer search
+   is expected to be blocked (Q5).
+7. One player: list yourself in the tool for a minute, then delist (Q8).
+
+**Network tests**
+
+8. `/probe roster` on both (Q10).
+9. One player: `/probe burst 20`, then `/probe rate 1 60`, then `/probe rate 3 30`. The other player
+   checks the report afterwards (Q9, Q11).
+
+**Layer test**
+
+10. Player A invites player B. B keeps mousing over NPCs. The probe prints how many seconds the layer
+    change took (Q12). Leave the group and repeat once.
+
+**Wrap up**
+
+11. Both: `/probe report`, then `/reload`. Send both
+    `WTF/Account/<ACCOUNT>/SavedVariables/LayerProbe.lua` files for analysis.
+
+Other commands: `/probe peer clear`, `/probe dungeon all`, `/probe reset` (wipes data).
+
+## Notes
+
+- Names on Forever are "First Surname". The probe uses full names and tags leaders "Name-Realm".
+- Anything the client marks secret is saved as `<secret>` rather than breaking the probe.
+- Other Forever addons report that custom channels refuse addon messages (since 11-07) and that
+  search needs a click. The probe verifies both rather than assuming.

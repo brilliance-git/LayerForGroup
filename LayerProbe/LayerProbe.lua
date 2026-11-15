@@ -1,19 +1,28 @@
--- LayerProbe (WoW: Forever edition): answers the questions LayerLink depends on, with data.
---   Q0  Which LFG API does this client have at all?      (C_LFGList inventory, Blizzard LFG addons loaded)
---   Q1  Is the LFG tool limited to your layer?            (compare scans from different layers)
---   Q2  Which message routes reach a player on another layer? (custom channel, guild, whisper)
---   Q3  What can an addon read from a listing?            (full result dumps + activity names)
---   Q4  When may an addon search?                         (button / slash / timer)
---   Q5  How many addon messages get through?              (burst test per route, send results logged)
---   Q6  How do layers behave?                             (zone id per map, every change logged)
--- Forever specifics handled here: names are "First Surname", some values arrive as secret values,
--- layers are per zone, and custom-channel addon messages reportedly don't deliver (Q2 checks it).
--- Data: WTF/Account/<acct>/SavedVariables/LayerProbe.lua. Type /probe for commands.
+-- LayerProbe (WoW: Forever): measures everything needed to build one bigger LFG list for a
+-- dungeon by combining what LFG-tool users on different layers (and realms) can each see.
+--
+--  TOOL       Q0 api        which C_LFGList functions exist, Blizzard LFG addons/frames loaded
+--             Q1 layers     do players on different layers see different listings?   (peer scan overlap)
+--             Q2 realms     does the tool show other backend realms?                  (leader realm suffixes)
+--             Q3 zones      does the tool only show your zone?                         (leaders' areaName)
+--             Q4 fields     what can be read: names, roles, levels, classes, comments, member counts
+--             Q5 search     click / slash / timer permission, minimum gap between searches
+--             Q6 lifecycle  how long listings live, churn between scans
+--             Q7 dungeon    per-dungeon supply (groups vs solo) and how much the list GROWS when merged
+--             Q8 own entry  can an addon read your own listing (to auto-publish it)?
+--  NETWORK    Q9 routes     custom channel / guild / party / whisper: delivered? across layers?
+--             Q10 discovery can we join a channel, and read its member list to find other users?
+--             Q11 rate      sustained messages per second per route, result codes
+--  LAYERS     Q12 layers    zone id per map, and how long after joining a group your layer changes
+--             Q13 lockdown  when values come back secret (instances, chat-messaging lockdown)
+--
+-- Data: WTF/Account/<acct>/SavedVariables/LayerProbe.lua. /probe for commands, /probe report for answers.
 local ADDON = ...
 local PREFIX, CHANNEL = "LProbe", "LayerProbeNet"
 local db
-local myName, layer, layerMap = nil, nil, nil
-local pendingSearch -- { how }
+local myName, myRealm, layer, layerMap = nil, nil, nil, nil
+local pending -- the search in flight: { how, at, gap }
+local lastSearchAt
 
 ---------------------------------------------------------------------------
 -- helpers
@@ -25,11 +34,19 @@ local function isSecret(...)
 end
 
 local function now() return GetServerTime() end
+
 local function out(...)
   local parts = {}
   for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
   DEFAULT_CHAT_FRAME:AddMessage("|cffff9933LayerProbe|r: " .. table.concat(parts, " "))
 end
+
+local function lockdown()
+  local chat = C_ChatInfo and C_ChatInfo.InChatMessagingLockdown and C_ChatInfo.InChatMessagingLockdown()
+  return { instance = IsInInstance() and true or false, chatLockdown = (not isSecret(chat)) and chat or "secret",
+           combat = InCombatLockdown() and true or false }
+end
+
 local function log(kind, data)
   data = data or {}
   data.kind, data.t, data.layer, data.map = kind, now(), layer, layerMap
@@ -46,7 +63,6 @@ local function copy(v, depth)
   return c
 end
 
--- What a listing string looks like to us: readable, a protected token, secret, or nothing.
 local function describeString(s)
   if isSecret(s) then return "secret" end
   if s == nil then return "nil" end
@@ -56,7 +72,14 @@ local function describeString(s)
   return "readable(" .. #s .. "): " .. s:sub(1, 60)
 end
 
--- Forever names: "First Surname" (UnitName alone gives only the first name).
+local function count(t) local n = 0 for _ in pairs(t or {}) do n = n + 1 end return n end
+local function median(list)
+  if #list == 0 then return nil end
+  table.sort(list)
+  return list[math.ceil(#list / 2)]
+end
+
+-- Forever names are "First Surname"; UnitName alone gives only the first name.
 local function getMyName()
   local first, second = UnitFullName("player")
   if not isSecret(first, second) and first and C_PlayerInfo and C_PlayerInfo.ShouldDisplaySurname
@@ -67,18 +90,35 @@ local function getMyName()
   return (not isSecret(n) and n) or "?"
 end
 
--- "First Surname-Realm" -> "First Surname"; plain names lose a realm suffix only if it's ours.
+-- For whispering: "First Surname-Realm" -> "First Surname".
 local function normName(name)
   if isSecret(name) or type(name) ~= "string" or name == "" then return nil end
   return name:match("^(%S+ %S+)%-%S+$") or Ambiguate(name, "none")
 end
 
+-- For identity across clients: always "Name-Realm" (the tool omits the realm for your own realm).
+local function fullKey(name)
+  if isSecret(name) or type(name) ~= "string" or name == "" then return nil end
+  if name:find("-", 1, true) then return name end
+  return name .. "-" .. (myRealm or "?")
+end
+
+local function realmOf(key) return key and key:match("%-([^%-]+)$") end
+
+local RESULT_NAMES = {}
+if Enum and Enum.SendAddonMessageResult then
+  for k, v in pairs(Enum.SendAddonMessageResult) do RESULT_NAMES[v] = k end
+end
+local function resultName(r) return RESULT_NAMES[r] or tostring(r) end
+
 ---------------------------------------------------------------------------
 -- Q0: API inventory
 ---------------------------------------------------------------------------
-local WANTED = { "Search", "GetSearchResults", "GetSearchResultInfo", "GetSearchResultPlayerInfo",
-  "GetSearchResultLeaderInfo", "GetActivityInfoTable", "GetAvailableCategories", "GetAvailableActivities",
-  "GetLfgCategoryInfo", "HasActiveEntryInfo", "GetActiveEntryInfo", "CreateListing", "RemoveListing", "GetRoles" }
+local WANTED = { "Search", "GetSearchResults", "GetFilteredSearchResults", "HasSearchResultInfo", "GetSearchResultInfo",
+  "GetSearchResultPlayerInfo", "GetSearchResultLeaderInfo", "GetSearchResultMemberCounts", "GetActivityInfoTable",
+  "GetActivityGroupInfo", "GetAvailableCategories", "GetAvailableActivities", "GetLfgCategoryInfo",
+  "HasActiveEntryInfo", "GetActiveEntryInfo", "CreateListing", "UpdateListing", "RemoveListing",
+  "IsPlayerAuthenticatedForLFG", "GetRoles" }
 
 local function inventory()
   local inv = { lfglist = {}, missing = {}, addons = {}, frames = {} }
@@ -104,13 +144,48 @@ local function inventory()
                         "GroupFinderFrame", "LFDParentFrame" }) do
     inv.frames[fr] = _G[fr] ~= nil
   end
+  inv.authenticated = C_LFGList and C_LFGList.IsPlayerAuthenticatedForLFG and copy(C_LFGList.IsPlayerAuthenticatedForLFG())
   db.inventory = inv
   return inv
 end
 
+-- Every category/activity the tool offers, with names (also tells LayerLink how to map dungeons).
+local function catalog()
+  local list = {}
+  if not (C_LFGList and C_LFGList.GetAvailableCategories) then return list end
+  for _, cat in ipairs(C_LFGList.GetAvailableCategories() or {}) do
+    local catInfo = C_LFGList.GetLfgCategoryInfo and C_LFGList.GetLfgCategoryInfo(cat)
+    for _, a in ipairs(C_LFGList.GetAvailableActivities(cat) or {}) do
+      local ok, info = pcall(C_LFGList.GetActivityInfoTable, a)
+      list[#list + 1] = { id = a, cat = cat, catName = catInfo and copy(catInfo.name),
+        name = ok and info and copy(info.fullName) or "?", maxPlayers = ok and info and copy(info.maxNumPlayers),
+        minLevel = ok and info and copy(info.minLevelSuggestion or info.minLevel),
+        maxLevel = ok and info and copy(info.maxLevelSuggestion) }
+    end
+  end
+  db.catalog = list
+  return list
+end
+
+local function activityName(id)
+  for _, a in ipairs(db.catalog or {}) do if a.id == id then return a.name end end
+  local ok, info = pcall(C_LFGList.GetActivityInfoTable, id)
+  return ok and info and not isSecret(info.fullName) and info.fullName or tostring(id)
+end
+
 ---------------------------------------------------------------------------
--- Q6: layers (per zone on Forever)
+-- Q12: layers (per zone on Forever) and layer change after joining a group
 ---------------------------------------------------------------------------
+local wasInGroup = false
+
+local function onLayerChanged(old, new, map)
+  local j = db.joins[#db.joins]
+  if j and not j.changedAt and j.map == map and j.layerBefore and j.layerBefore ~= new then
+    j.changedAt, j.delay, j.layerAfter = now(), now() - j.t, new
+    out(("layer changed %ds after joining the group"):format(j.delay))
+  end
+end
+
 local function sample(unit)
   if IsInInstance() then return end
   local guid = UnitGUID(unit)
@@ -125,28 +200,47 @@ local function sample(unit)
   if id ~= layer then
     log("layer", { from = layer, to = id, serverID = serverID, instanceID = instanceID, npcID = npcID, newMap = map })
     if layer then out("layer changed", layer, "->", id, "(map " .. tostring(map) .. ")") end
+    local old = layer
     layer, layerMap = id, map
     local key = tostring(map)
     s.byMap[key] = s.byMap[key] or {}
     s.byMap[key][tostring(id)] = (s.byMap[key][tostring(id)] or 0) + 1
+    onLayerChanged(old, id, map)
   end
 end
 
----------------------------------------------------------------------------
--- Q2 + Q5: message routes. Every message goes out on every route we have;
--- the receiver records which route (CHANNEL / GUILD / WHISPER) it arrived on.
----------------------------------------------------------------------------
-local function sendOne(msg, dist, target)
-  local ok, r = pcall(C_ChatInfo.SendAddonMessage, PREFIX, msg, dist, target)
-  local key = dist .. ":" .. (ok and tostring(r) or ("error " .. tostring(r)))
-  db.sendResults[key] = (db.sendResults[key] or 0) + 1
+local function onGroupChanged()
+  local inGroup = IsInGroup() and true or false
+  if inGroup and not wasInGroup then
+    db.joins[#db.joins + 1] = { t = now(), layerBefore = layer, map = layerMap, size = GetNumGroupMembers() }
+    if #db.joins > 100 then table.remove(db.joins, 1) end
+    out("joined a group on layer " .. tostring(layer) .. " - keep targeting NPCs to time the layer change")
+  elseif not inGroup and wasInGroup then
+    local j = db.joins[#db.joins]
+    if j and not j.leftAt then j.leftAt = now() end
+  end
+  wasInGroup = inGroup
+  log("group", { size = GetNumGroupMembers() })
 end
 
-local function sendAll(msg)
-  local idx = GetChannelName(CHANNEL)
-  if idx and idx > 0 then sendOne(msg, "CHANNEL", idx) end
-  if IsInGuild() then sendOne(msg, "GUILD") end
-  for name in pairs(db.peerTargets) do sendOne(msg, "WHISPER", name) end
+---------------------------------------------------------------------------
+-- Q9 + Q11: message routes. Each message goes on every route; receivers record the route.
+---------------------------------------------------------------------------
+local function sendOne(msg, dist, target, tag)
+  local ok, r = pcall(C_ChatInfo.SendAddonMessage, PREFIX, msg, dist, target)
+  local key = dist .. ":" .. (ok and resultName(r) or ("error " .. tostring(r)))
+  db.sendResults[key] = (db.sendResults[key] or 0) + 1
+  if tag then db.rateSent[tag] = db.rateSent[tag] or {}; db.rateSent[tag][key] = (db.rateSent[tag][key] or 0) + 1 end
+end
+
+local function sendAll(msg, tag, whisperOnly)
+  if not whisperOnly then
+    local idx = GetChannelName(CHANNEL)
+    if idx and idx > 0 then sendOne(msg, "CHANNEL", idx, tag) end
+    if IsInGuild() then sendOne(msg, "GUILD", nil, tag) end
+    if IsInGroup() then sendOne(msg, IsInRaid() and "RAID" or "PARTY", nil, tag) end
+  end
+  for name in pairs(db.peerTargets) do sendOne(msg, "WHISPER", name, tag) end
 end
 
 local function sendChunks(head, items)
@@ -162,25 +256,38 @@ local function sendChunks(head, items)
 end
 
 local seq = 0
-local function ping(tag)
+local function ping(tag, whisperOnly)
   seq = seq + 1
-  sendAll(("P^%s^%s^%d^%d^%s"):format(layer or "", layerMap or "", seq, now(), tag or ""))
+  sendAll(("P^%s^%s^%d^%d^%s^%s"):format(layer or "", layerMap or "", seq, now(), tag or "", myRealm or ""),
+    tag ~= "auto" and tag ~= "login" and tag ~= "manual" and tag or nil, whisperOnly)
 end
 
 local function burst(n)
   out("sending " .. n .. " messages on every route as fast as possible...")
-  for i = 1, n do ping("burst" .. i) end
-  log("burst", { n = n })
+  for i = 1, n do ping("burst") end
+end
+
+local rateTicker
+local function rateTest(perSec, seconds)
+  if rateTicker then rateTicker:Cancel() end
+  local total, sent = math.floor(perSec * seconds), 0
+  local tag = ("rate%gx%d"):format(perSec, seconds)
+  out(("whispering %d msgs/s for %ds to your peers (%s)..."):format(perSec, seconds, tag))
+  rateTicker = C_Timer.NewTicker(1 / perSec, function()
+    sent = sent + 1
+    ping(tag, true)
+    if sent >= total then rateTicker = nil; out(tag .. " done - ask your peer for /probe report") end
+  end, total) -- the ticker stops itself after `total` runs
 end
 
 local function onAddonMessage(prefix, msg, dist, sender)
   if isSecret(prefix, msg, dist, sender) then
-    db.secretMessages = (db.secretMessages or 0) + 1
+    db.secret.messages = (db.secret.messages or 0) + 1
     return
   end
   if prefix ~= PREFIX then return end
-  sender = normName(sender)
-  if not sender or sender:lower() == (myName or ""):lower() then return end
+  local whisperName = normName(sender)
+  if not whisperName or whisperName:lower() == (myName or ""):lower() then return end
   local f = { strsplit("^", msg) }
   local theirLayer = f[2] or ""
   local cross = theirLayer ~= "" and layer and tonumber(theirLayer) ~= layer
@@ -188,178 +295,431 @@ local function onAddonMessage(prefix, msg, dist, sender)
   local route = db.routes[dist] or { received = 0, crossLayer = 0, from = {} }
   route.received = route.received + 1
   if cross then route.crossLayer = route.crossLayer + 1 end
-  route.from[sender] = theirLayer
+  route.from[whisperName] = theirLayer
   db.routes[dist] = route
 
-  -- answer anyone we hear from by whisper too, so the WHISPER route gets tested both ways
-  if not db.peerTargets[sender] and dist ~= "WHISPER" then
-    local n = 0 for _ in pairs(db.peerTargets) do n = n + 1 end
-    if n < 10 then db.peerTargets[sender] = true end
+  if not db.peerTargets[whisperName] and dist ~= "WHISPER" and count(db.peerTargets) < 10 then
+    db.peerTargets[whisperName] = true -- answer by whisper too, so that route gets tested both ways
   end
 
   if f[1] == "P" then
+    db.peers[whisperName] = { layer = theirLayer, map = f[3], realm = f[7], senderRaw = sender, lastSeen = now() }
     if cross and not db.crossLayer[dist] then
-      db.crossLayer[dist] = { from = sender, theirLayer = theirLayer, ourLayer = layer, t = now() }
-      out(("|cff33ff99%s reaches another layer|r: ping from %s (layer %s, you %s)"):format(dist, sender, theirLayer, layer))
+      db.crossLayer[dist] = { from = whisperName, theirLayer = theirLayer, ourLayer = layer, t = now() }
+      out(("|cff33ff99%s reaches another layer|r: ping from %s (layer %s, you %s)"):format(dist, whisperName, theirLayer, tostring(layer)))
     end
-    if (f[6] or ""):find("^burst") then
-      local k = sender .. " via " .. dist
-      db.burstReceived[k] = (db.burstReceived[k] or 0) + 1
+    local tag = f[6] or ""
+    if tag ~= "" and tag ~= "auto" and tag ~= "login" and tag ~= "manual" then
+      local k = whisperName .. " " .. tag .. " via " .. dist
+      local r = db.rateReceived[k] or { n = 0 }
+      r.n = r.n + 1
+      r.first = r.first or now()
+      r.last = now()
+      db.rateReceived[k] = r
     end
   elseif f[1] == "S" then
-    local key = sender .. "@" .. (f[3] or "")
-    local ps = db.peerScans[key] or { by = sender, layer = theirLayer, t = tonumber(f[3]), n = tonumber(f[4]), leaders = {}, seen = {} }
-    for name in (f[5] or ""):gmatch("[^,]+") do
-      if not ps.seen[name] then ps.seen[name] = true; ps.leaders[#ps.leaders + 1] = name end
+    -- S^layer^time^map^realm^n ^ items "Name-Realm@activityID@G|S"
+    local key = whisperName .. "@" .. (f[3] or "")
+    local ps = db.peerScans[key] or { by = whisperName, layer = theirLayer, t = tonumber(f[3]), map = f[4],
+                                      realm = f[5], n = tonumber(f[6]), items = {} }
+    for item in (f[7] or ""):gmatch("[^,]+") do
+      local who, act, kind = item:match("^(.-)@(%d+)@([GS])$")
+      if who then ps.items[who] = { act = tonumber(act), kind = kind } end
     end
-    db.peerScans[key] = ps -- the same chunk may arrive on several routes; `seen` dedups
+    db.peerScans[key] = ps -- the same chunk may arrive on several routes; keyed items dedup
   end
 end
 
 ---------------------------------------------------------------------------
--- Q1 + Q3: harvesting search results
+-- Q10: discovery - channel join outcome and member-list (roster) reading
 ---------------------------------------------------------------------------
-local function dumpActivity(id)
-  if db.activities[id] or not C_LFGList.GetActivityInfoTable then return end
-  local ok, info = pcall(C_LFGList.GetActivityInfoTable, id)
-  db.activities[id] = ok and (copy(info) or "nil") or ("error: " .. tostring(info))
+local rosterWanted = {} -- displayIndex -> channel name we asked about
+
+local function requestRoster(channelName)
+  if not (GetNumDisplayChannels and GetChannelDisplayInfo and SetSelectedDisplayChannel) then
+    db.discovery.rosterApi = "missing"
+    return out("roster API missing on this client")
+  end
+  if InCombatLockdown() then return out("not during combat") end
+  local mine, other
+  for i = 1, GetNumDisplayChannels() or 0 do
+    local ok, name, header = pcall(GetChannelDisplayInfo, i)
+    if ok and not header and type(name) == "string" and not isSecret(name) then
+      if name == channelName then mine = i elseif not other then other = i end
+    end
+  end
+  if not mine then
+    db.discovery.rosters[channelName] = { error = "not in a channel called " .. channelName, t = now() }
+    return out("not in channel " .. channelName)
+  end
+  rosterWanted[mine] = channelName
+  -- the server sends a list when a channel becomes selected; selecting another first forces a resend
+  if other then pcall(SetSelectedDisplayChannel, other) end
+  pcall(SetSelectedDisplayChannel, mine)
+  C_Timer.After(10, function()
+    if rosterWanted[mine] then
+      db.discovery.rosters[channelName] = { error = "no roster update within 10s", t = now() }
+      rosterWanted[mine] = nil
+    end
+  end)
+end
+
+local function onRoster(displayIndex, countArg)
+  local channelName = rosterWanted[displayIndex]
+  if not channelName then return end
+  rosterWanted[displayIndex] = nil
+  local r = { t = now(), reported = copy(countArg), readable = 0, secret = 0, sample = {} }
+  local n = tonumber(not isSecret(countArg) and countArg) or 0
+  for i = 1, math.min(n, 500) do
+    local ok, name = pcall(C_ChatInfo.GetChannelRosterInfo, displayIndex, i)
+    if ok and isSecret(name) then r.secret = r.secret + 1
+    elseif ok and type(name) == "string" then
+      r.readable = r.readable + 1
+      if #r.sample < 5 then r.sample[#r.sample + 1] = name end
+    end
+  end
+  db.discovery.rosters[channelName] = r
+  out(("roster of %s: %s members reported, %d names readable, %d secret"):format(channelName, tostring(countArg), r.readable, r.secret))
+end
+
+local function joinChannel()
+  if GetChannelName(CHANNEL) ~= 0 then
+    db.discovery.join = db.discovery.join or { ok = true, already = true, indexAfter = GetChannelName(CHANNEL), t = now() }
+    return
+  end
+  local ok, err = pcall(JoinTemporaryChannel, CHANNEL)
+  db.discovery.join = { ok = ok, err = err and tostring(err), t = now() }
+  C_Timer.After(3, function()
+    local idx = GetChannelName(CHANNEL)
+    db.discovery.join.indexAfter = idx
+    log("channel-join", db.discovery.join)
+  end)
+end
+
+---------------------------------------------------------------------------
+-- Q1-Q8: search results
+---------------------------------------------------------------------------
+local function readResult(id, scan)
+  local gotInfo, info = pcall(C_LFGList.GetSearchResultInfo, id)
+  if not gotInfo or type(info) ~= "table" then return nil end
+  local acts = (type(info.activityIDs) == "table" and info.activityIDs) or { info.activityID }
+  local n = tonumber(not isSecret(info.numMembers) and info.numMembers) or 0
+  local r = {
+    leader = describeString(info.leaderName), key = fullKey(info.leaderName), numMembers = copy(info.numMembers),
+    age = copy(info.age), isDelisted = copy(info.isDelisted), activityIDs = copy(acts), hasSelf = copy(info.hasSelf),
+    playstyle = copy(info.playstyle), generalPlaystyle = copy(info.generalPlaystyle), autoAccept = copy(info.autoAccept),
+    name = describeString(info.name), comment = describeString(info.comment), members = {},
+  }
+  if C_LFGList.GetSearchResultMemberCounts then
+    local ok, mc = pcall(C_LFGList.GetSearchResultMemberCounts, id)
+    r.memberCounts = ok and copy(mc) or "error"
+  end
+  for m = 1, math.min(n, 40) do
+    local gotP, p = pcall(C_LFGList.GetSearchResultPlayerInfo, id, m)
+    if gotP and type(p) == "table" then
+      local mem = { name = describeString(p.name), level = copy(p.level), class = copy(p.classFilename),
+        role = copy(p.assignedRole), lfgRoles = copy(p.lfgRoles), isLeader = copy(p.isLeader), area = copy(p.areaName) }
+      r.members[m] = mem
+      if (p.isLeader or n == 1) and not isSecret(p.areaName) then r.leaderArea = p.areaName end
+    else
+      r.members[m] = gotP and "nil" or "error"
+    end
+  end
+  -- count which fields came back secret (Q13)
+  for _, field in ipairs({ "leaderName", "numMembers", "activityIDs", "name", "comment", "age" }) do
+    if isSecret(info[field]) then scan.secretFields[field] = (scan.secretFields[field] or 0) + 1 end
+  end
+  return r, acts, n
 end
 
 local function onResults()
+  while #db.searchLog > 300 do table.remove(db.searchLog, 1) end
   local ok, total, results = pcall(C_LFGList.GetSearchResults)
+  local p = pending
+  pending = nil
+  if p then
+    db.searchLog[#db.searchLog + 1] = { how = p.how, gap = p.gap, outcome = ok and "results" or "unreadable", t = now() }
+  end
   if not ok or type(results) ~= "table" then
     log("results-unreadable", { err = tostring(total) })
     return out("search results arrived but couldn't be read: " .. tostring(total))
   end
-  local scan = { t = now(), layer = layer, map = layerMap, total = total, n = #results, leaders = {},
-                 how = pendingSearch and pendingSearch.how or "blizzard-ui", results = {} }
-  pendingSearch = nil
+  local zone = GetRealZoneText and GetRealZoneText() or "?"
+  local scan = { t = now(), layer = layer, map = layerMap, zone = zone, realm = myRealm, total = copy(total), n = #results,
+                 how = p and p.how or "blizzard-ui", searched = db.lastSearchActs, lockdown = lockdown(),
+                 results = {}, items = {}, secretFields = {}, realms = {}, sameZone = 0, otherZone = 0,
+                 unknownZone = 0, groups = 0, solo = 0, byActivity = {} }
   for i, id in ipairs(results) do
-    local gotInfo, info = pcall(C_LFGList.GetSearchResultInfo, id)
-    if gotInfo and type(info) == "table" then
-      for _, a in ipairs(type(info.activityIDs) == "table" and info.activityIDs or { info.activityID }) do dumpActivity(a) end
-      local r = {
-        leader = describeString(info.leaderName), numMembers = copy(info.numMembers), age = copy(info.age),
-        isDelisted = copy(info.isDelisted), activityIDs = copy(info.activityIDs), activityID = copy(info.activityID),
-        hasSelf = copy(info.hasSelf), playstyle = copy(info.playstyle), generalPlaystyle = copy(info.generalPlaystyle),
-        name = describeString(info.name), comment = describeString(info.comment), members = {},
-      }
-      local n = tonumber(not isSecret(info.numMembers) and info.numMembers) or 0
-      for m = 1, math.min(n, 40) do
-        local gotP, p = pcall(C_LFGList.GetSearchResultPlayerInfo, id, m)
-        r.members[m] = (gotP and type(p) == "table") and { name = describeString(p.name), level = copy(p.level),
-          class = copy(p.classFilename), role = copy(p.assignedRole), lfgRoles = copy(p.lfgRoles),
-          isLeader = copy(p.isLeader), area = describeString(p.areaName) } or (gotP and "nil" or "error")
+    local r, acts, n = readResult(id, scan)
+    if r then
+      if i <= 80 then scan.results[#scan.results + 1] = r end
+      local kind = n == 1 and "S" or "G"
+      if kind == "S" then scan.solo = scan.solo + 1 else scan.groups = scan.groups + 1 end
+      local act = tonumber(acts[1]) or 0
+      local ba = scan.byActivity[act] or { groups = 0, solo = 0 }
+      if kind == "S" then ba.solo = ba.solo + 1 else ba.groups = ba.groups + 1 end
+      scan.byActivity[act] = ba
+      if r.key then
+        scan.items[r.key] = { act = act, kind = kind }
+        local realm = realmOf(r.key) or "?"
+        scan.realms[realm] = (scan.realms[realm] or 0) + 1
+        local life = db.lifecycle[r.key] or { first = scan.t, scans = 0 }
+        life.last, life.scans = scan.t, life.scans + 1
+        db.lifecycle[r.key] = life
       end
-      if i <= 60 then scan.results[#scan.results + 1] = r end -- keeps the file a sane size
-      local leader = normName(info.leaderName)
-      if leader then scan.leaders[#scan.leaders + 1] = leader end
-      if #db.rawSamples < 5 then db.rawSamples[#db.rawSamples + 1] = copy(info) end
+      if not r.leaderArea then scan.unknownZone = scan.unknownZone + 1
+      elseif r.leaderArea == zone then scan.sameZone = scan.sameZone + 1
+      else scan.otherZone = scan.otherZone + 1 end
+      if #db.rawSamples < 5 then
+        local _, raw = pcall(C_LFGList.GetSearchResultInfo, id)
+        db.rawSamples[#db.rawSamples + 1] = copy(raw)
+      end
     end
   end
+  -- churn vs the previous own scan of the same search, within 5 minutes (Q6)
+  local prev = db.scans[#db.scans]
+  if prev and prev.searched == scan.searched and scan.t - prev.t <= 300 and count(prev.items) > 0 then
+    local gone = 0
+    for k in pairs(prev.items) do if not scan.items[k] then gone = gone + 1 end end
+    scan.churn = { gone = gone, of = count(prev.items), seconds = scan.t - prev.t }
+  end
   table.insert(db.scans, scan)
-  if #db.scans > 200 then table.remove(db.scans, 1) end
-  out(("scan: %d results (total %s) on layer %s, map %s, via %s"):format(#results, tostring(total), tostring(layer),
-    tostring(layerMap), scan.how))
-  sendChunks(("S^%s^%d^%d"):format(layer or "", scan.t, #scan.leaders), scan.leaders)
+  if #db.scans > 150 then table.remove(db.scans, 1) end
+  out(("scan: %d results (%d groups, %d solo) on layer %s in %s via %s"):format(#results, scan.groups, scan.solo,
+    tostring(layer), zone, scan.how))
+  local items = {}
+  for k, v in pairs(scan.items) do items[#items + 1] = k .. "@" .. v.act .. "@" .. v.kind end
+  sendChunks(("S^%s^%d^%s^%s^%d"):format(layer or "", scan.t, layerMap or "", myRealm or "", #items), items)
 end
 
 ---------------------------------------------------------------------------
--- Q4: search permission tests
+-- Q5: searching (permission tests + spacing)
 ---------------------------------------------------------------------------
-local function doSearch(how)
-  if not (C_LFGList and C_LFGList.Search) then return out("C_LFGList.Search does not exist on this client") end
+local function searchTarget()
+  local t = db.target
+  if t and t.cat then return t.cat, t.ids end
   local cats = C_LFGList.GetAvailableCategories and C_LFGList.GetAvailableCategories() or {}
   local cat = cats[1]
+  return cat, cat and C_LFGList.GetAvailableActivities(cat) or nil
+end
+
+local function doSearch(how)
+  if not (C_LFGList and C_LFGList.Search) then return out("C_LFGList.Search does not exist on this client") end
+  local cat, acts = searchTarget()
   if not cat then return out("no LFG categories available - open the LFG tool once, then retry") end
-  local acts = C_LFGList.GetAvailableActivities and C_LFGList.GetAvailableActivities(cat) or nil
-  pendingSearch = { how = how }
+  local t = GetTime()
+  pending = { how = how, at = t, gap = lastSearchAt and (t - lastSearchAt) or nil }
+  lastSearchAt = t
   local ok, err = pcall(C_LFGList.Search, cat, 0, 0, nil, false, nil, acts)
   log("search-call", { how = how, ok = ok, err = err and tostring(err), category = cat, nActivities = acts and #acts })
   db.searchTests[how] = db.searchTests[how] or { calls = 0, results = 0, blocked = 0, failed = 0, errors = 0 }
-  local t = db.searchTests[how]
-  t.calls = t.calls + 1
-  if not ok then t.errors = t.errors + 1; out("search error via " .. how .. ": " .. tostring(err)) end
+  local s = db.searchTests[how]
+  s.calls = s.calls + 1
+  if not ok then
+    s.errors = s.errors + 1
+    db.searchLog[#db.searchLog + 1] = { how = how, gap = pending.gap, outcome = "error", t = now() }
+    pending = nil
+    out("search error via " .. how .. ": " .. tostring(err))
+  end
+end
+
+local function setDungeon(arg)
+  local cat = catalog()
+  if arg == "" then
+    out("activities (" .. #cat .. "), pick one with /probe dungeon <name>:")
+    local seen = {}
+    for _, a in ipairs(cat) do
+      if not seen[a.name] then seen[a.name] = true; out(("  [%s] %s"):format(tostring(a.id), tostring(a.name))) end
+    end
+    return
+  end
+  if arg == "all" then db.target = nil; return out("scans now cover the whole first category") end
+  local q, hits = arg:lower(), { ids = {}, names = {} }
+  for _, a in ipairs(cat) do
+    if type(a.name) == "string" and a.name:lower():find(q, 1, true) and (not hits.cat or hits.cat == a.cat) then
+      hits.cat = a.cat
+      hits.ids[#hits.ids + 1] = a.id
+      hits.names[#hits.names + 1] = a.name
+    end
+  end
+  if not hits.cat then return out("no activity matches '" .. arg .. "' - /probe dungeon lists them") end
+  hits.query = arg
+  db.target = hits
+  out("target: " .. table.concat(hits.names, ", ") .. " - scans and the report now focus on it")
 end
 
 ---------------------------------------------------------------------------
 -- Report
 ---------------------------------------------------------------------------
-local function overlap()
-  local n, shared, union = 0, 0, 0
+local function targetSet()
+  local set = {}
+  for _, id in ipairs(db.target and db.target.ids or {}) do set[id] = true end
+  return next(set) and set or nil
+end
+
+-- Cross-layer comparison of own scans with peer scans taken within 3 minutes on another layer.
+local function compare()
+  local res = { pairs = 0, shared = 0, union = 0, mine = 0, tMine = 0, tUnion = 0, tPairs = 0 }
+  local tset = targetSet()
   for _, mine in ipairs(db.scans) do
-    local set = {}
-    for _, l in ipairs(mine.leaders) do set[l:lower()] = true end
     for _, theirs in pairs(db.peerScans) do
       if mine.layer and theirs.layer ~= "" and tonumber(theirs.layer) ~= mine.layer
-         and math.abs((theirs.t or 0) - mine.t) <= 180 and #theirs.leaders > 0 and #mine.leaders > 0 then
-        n = n + 1
-        local u = {}
-        for l in pairs(set) do u[l] = true end
-        for _, l in ipairs(theirs.leaders) do if set[l:lower()] then shared = shared + 1 end u[l:lower()] = true end
-        for _ in pairs(u) do union = union + 1 end
+         and math.abs((theirs.t or 0) - mine.t) <= 180 and count(theirs.items) > 0 and count(mine.items) > 0 then
+        res.pairs = res.pairs + 1
+        local u, tu, tm = {}, {}, 0
+        for k, v in pairs(mine.items) do
+          u[k] = true
+          if tset and tset[v.act] then tu[k] = true; tm = tm + 1 end
+        end
+        for k, v in pairs(theirs.items) do
+          if mine.items[k] then res.shared = res.shared + 1 end
+          u[k] = true
+          if tset and tset[v.act] then tu[k] = true end
+        end
+        res.union, res.mine = res.union + count(u), res.mine + count(mine.items)
+        if tset then res.tPairs, res.tMine, res.tUnion = res.tPairs + 1, res.tMine + tm, res.tUnion + count(tu) end
       end
     end
   end
-  return n, shared, union
+  return res
 end
 
 local function report()
-  out("---- report (" .. myName .. ", build " .. tostring(db.client.build) .. ") ----")
+  out("==== LayerProbe report: " .. tostring(myName) .. "-" .. tostring(myRealm) .. ", build " .. tostring(db.client.build) .. " ====")
   local inv = inventory()
-  out(("Q0 api: %d C_LFGList functions; missing: %s"):format(#inv.lfglist, #inv.missing > 0 and table.concat(inv.missing, ", ") or "none"))
+  out(("TOOL Q0 api: %d C_LFGList functions; missing: %s"):format(#inv.lfglist, #inv.missing > 0 and table.concat(inv.missing, ", ") or "none"))
   local addons = {}
   for name, state in pairs(inv.addons) do addons[#addons + 1] = name .. "=" .. state end
-  out("Q0 lfg addons: " .. (#addons > 0 and table.concat(addons, " ") or "none found"))
+  out("     lfg addons: " .. (#addons > 0 and table.concat(addons, " ") or "none found"))
 
-  local maps, ids = 0, 0
-  for _, byId in pairs(db.layerStats.byMap) do maps = maps + 1 for _ in pairs(byId) do ids = ids + 1 end end
-  out(("Q6 layer: current %s on map %s; %d samples; %d zone ids across %d maps"):format(tostring(layer),
-    tostring(layerMap), db.layerStats.samples, ids, maps))
-
-  for _, dist in ipairs({ "CHANNEL", "GUILD", "WHISPER", "PARTY", "RAID" }) do
-    local r = db.routes[dist]
-    if r then
-      local from = 0 for _ in pairs(r.from) do from = from + 1 end
-      out(("Q2 %s: %d msgs from %d players, %d from another layer %s"):format(dist, r.received, from, r.crossLayer,
-        db.crossLayer[dist] and "|cff33ff99(crosses layers)|r" or ""))
-    end
-  end
-  if not next(db.routes) then out("Q2 routes: nothing received yet - add a friend with /probe peer First Surname") end
-
-  local pairsN, shared, union = overlap()
-  if pairsN == 0 then
-    out("Q1 tool: no scan pairs from different layers within 3 min yet (scan at the same time as a friend on another layer)")
+  local c = compare()
+  if c.pairs == 0 then
+    out("TOOL Q1 layers: no scan pairs from different layers within 3 min yet (scan together with a peer)")
   else
-    local pct = union > 0 and math.floor(100 * shared / union) or 0
-    out(("Q1 tool: %d cross-layer scan pairs, %d%% leaders shared -> %s"):format(pairsN, pct,
-      pct < 15 and "|cff33ff99tool looks layer-limited (LayerLink is useful)|r"
-      or pct > 70 and "|cffff5555tool looks realm-wide (layers already see each other)|r" or "mixed - collect more"))
+    local pct = c.union > 0 and math.floor(100 * c.shared / c.union) or 0
+    out(("TOOL Q1 layers: %d cross-layer scan pairs, %d%% of listings shared -> %s"):format(c.pairs, pct,
+      pct < 15 and "|cff33ff99tool is layer-limited: merging helps|r"
+      or pct > 70 and "|cffff5555tool already shows all layers|r" or "mixed - collect more"))
+    out(("     merged list is %.1fx your own view on average"):format(c.mine > 0 and c.union / c.mine or 0))
   end
+
+  local realms, keys, foreign = {}, 0, 0
+  for _, s in ipairs(db.scans) do
+    for r, n in pairs(s.realms) do realms[r] = (realms[r] or 0) + n; keys = keys + n; if r ~= myRealm then foreign = foreign + n end end
+  end
+  out(("TOOL Q2 realms: %d listings seen from %d realms, %d%% from other realms than yours"):format(keys, count(realms),
+    keys > 0 and math.floor(100 * foreign / keys) or 0))
+
+  local same, other, unknown = 0, 0, 0
+  for _, s in ipairs(db.scans) do same, other, unknown = same + s.sameZone, other + s.otherZone, unknown + s.unknownZone end
+  out(("TOOL Q3 zones: leaders in your zone %d, elsewhere %d, unknown %d -> %s"):format(same, other, unknown,
+    other > 0 and "tool is NOT zone-limited" or (same > 0 and "all in your zone so far (zone-limited?)" or "no data")))
 
   local last = db.scans[#db.scans]
   if last and last.results[1] then
     local r, m = last.results[1], last.results[1].members[1]
-    out(("Q3 read: leader=%s members=%s name=%s comment=%s"):format(r.leader, tostring(r.numMembers), r.name, r.comment))
+    out(("TOOL Q4 fields: leader=%s name=%s comment=%s memberCounts=%s"):format(r.leader, r.name, r.comment,
+      type(r.memberCounts) == "table" and "readable" or tostring(r.memberCounts)))
     if type(m) == "table" then
-      out(("Q3 member: level=%s class=%s role=%s"):format(tostring(m.level), tostring(m.class), tostring(m.role)))
+      out(("     member: level=%s class=%s role=%s area=%s"):format(tostring(m.level), tostring(m.class), tostring(m.role), tostring(m.area)))
     end
   else
-    out("Q3 read: no scans yet - open the LFG tool and hit refresh, or /probe scan")
+    out("TOOL Q4 fields: no scans yet - open the LFG tool and refresh, or /probe scan")
   end
 
   for how, t in pairs(db.searchTests) do
-    out(("Q4 search via %s: %d calls, %d result sets, %d blocked, %d failed, %d errors"):format(how, t.calls,
+    out(("TOOL Q5 search via %s: %d calls, %d result sets, %d blocked, %d failed, %d errors"):format(how, t.calls,
       t.results, t.blocked, t.failed, t.errors))
   end
+  local okGap, badGap
+  for _, s in ipairs(db.searchLog) do
+    if s.gap then
+      if s.outcome == "results" then okGap = math.min(okGap or 1e9, s.gap) else badGap = math.max(badGap or 0, s.gap) end
+    end
+  end
+  if okGap or badGap then
+    out(("     shortest gap that still got results: %s s; longest gap that failed: %s s"):format(
+      okGap and ("%.1f"):format(okGap) or "-", badGap and ("%.1f"):format(badGap) or "-"))
+  end
 
-  local sends, bursts = {}, {}
-  for k, c in pairs(db.sendResults) do sends[#sends + 1] = k .. " x" .. c end
-  for k, c in pairs(db.burstReceived) do bursts[#bursts + 1] = k .. "=" .. c end
+  local lifetimes, churnGone, churnOf = {}, 0, 0
+  for _, l in pairs(db.lifecycle) do if l.scans >= 2 then lifetimes[#lifetimes + 1] = l.last - l.first end end
+  for _, s in ipairs(db.scans) do if s.churn then churnGone, churnOf = churnGone + s.churn.gone, churnOf + s.churn.of end end
+  out(("TOOL Q6 lifecycle: %d listings seen 2+ times, median seen-for %s s; churn between scans %d%%"):format(
+    #lifetimes, tostring(median(lifetimes) or "-"), churnOf > 0 and math.floor(100 * churnGone / churnOf) or 0))
+
+  if db.target then
+    local tset, g, s, scans = targetSet(), 0, 0, 0
+    for _, sc in ipairs(db.scans) do
+      local hit = false
+      for act, ba in pairs(sc.byActivity) do if tset[act] then g, s, hit = g + ba.groups, s + ba.solo, true end end
+      if hit then scans = scans + 1 end
+    end
+    out(("TOOL Q7 %s: %d scans with it, avg %.1f groups + %.1f solo per scan"):format(db.target.query, scans,
+      scans > 0 and g / scans or 0, scans > 0 and s / scans or 0))
+    if c.tPairs > 0 then
+      out(("     merged with other layers: %.1f -> %.1f listings per scan (%.1fx)"):format(c.tMine / c.tPairs,
+        c.tUnion / c.tPairs, c.tMine > 0 and c.tUnion / c.tMine or 0))
+    end
+  else
+    out("TOOL Q7 dungeon: no target - /probe dungeon <name> to focus on one")
+  end
+
+  local own = db.ownEntry
+  out("TOOL Q8 own listing: " .. (own and (("seen %d times, readable=%s, activities=%s"):format(own.updates, tostring(own.readable),
+    tostring(own.activities))) or "list yourself in the tool once to test"))
+
+  for _, dist in ipairs({ "CHANNEL", "GUILD", "PARTY", "RAID", "WHISPER" }) do
+    local r = db.routes[dist]
+    if r then
+      out(("NET Q9 %s: %d msgs from %d players, %d from another layer %s"):format(dist, r.received, count(r.from),
+        r.crossLayer, db.crossLayer[dist] and "|cff33ff99(crosses layers)|r" or ""))
+    end
+  end
+  if not next(db.routes) then out("NET Q9 routes: nothing received yet - /probe peer First Surname") end
+  local sends = {}
+  for k, n in pairs(db.sendResults) do sends[#sends + 1] = k .. " x" .. n end
   table.sort(sends)
-  out("Q5 send results: " .. (#sends > 0 and table.concat(sends, ", ") or "none"))
-  out("Q5 burst received: " .. (#bursts > 0 and table.concat(bursts, ", ") or "none"))
-  if (db.secretMessages or 0) > 0 then out("note: " .. db.secretMessages .. " addon messages arrived as secret values") end
+  out("     send results: " .. (#sends > 0 and table.concat(sends, ", ") or "none"))
+
+  local d = db.discovery
+  out(("NET Q10 discovery: channel join %s (index after: %s)"):format(d.join and (d.join.already and "already in it"
+    or d.join.ok and "ok" or ("error " .. tostring(d.join.err))) or "not tried",
+    d.join and tostring(d.join.indexAfter) or "-"))
+  for ch, r in pairs(d.rosters) do
+    out(("     roster %s: %s"):format(ch, r.error or (("%s reported, %d readable, %d secret"):format(tostring(r.reported), r.readable, r.secret))))
+  end
+
+  local rec = {}
+  for k, r in pairs(db.rateReceived) do
+    rec[#rec + 1] = ("%s=%d in %ds"):format(k, r.n, (r.last or 0) - (r.first or 0))
+  end
+  table.sort(rec)
+  out("NET Q11 received: " .. (#rec > 0 and table.concat(rec, "; ") or "none (have a peer run /probe burst or /probe rate)"))
+  for tag, res in pairs(db.rateSent) do
+    local parts = {}
+    for k, n in pairs(res) do parts[#parts + 1] = k .. " x" .. n end
+    out("     sent " .. tag .. ": " .. table.concat(parts, ", "))
+  end
+
+  local maps, ids = 0, 0
+  for _, byId in pairs(db.layerStats.byMap) do maps = maps + 1; ids = ids + count(byId) end
+  local delays, noChange = {}, 0
+  for _, j in ipairs(db.joins) do
+    if j.delay then delays[#delays + 1] = j.delay elseif j.leftAt or now() - j.t > 360 then noChange = noChange + 1 end
+  end
+  out(("LAYER Q12: now %s on map %s; %d zone ids across %d maps; %d group joins, %d changed layer (median %ss), %d no change"):format(
+    tostring(layer), tostring(layerMap), ids, maps, #db.joins, #delays, tostring(median(delays) or "-"), noChange))
+
+  local sec, lockScans = {}, 0
+  for _, s in ipairs(db.scans) do
+    for f, n in pairs(s.secretFields) do sec[f] = (sec[f] or 0) + n end
+    if s.lockdown.instance or s.lockdown.chatLockdown == true then lockScans = lockScans + 1 end
+  end
+  local secList = {}
+  for f, n in pairs(sec) do secList[#secList + 1] = f .. " x" .. n end
+  out(("LAYER Q13 lockdown: %d scans in instance/lockdown; secret fields: %s; secret addon messages: %d"):format(lockScans,
+    #secList > 0 and table.concat(secList, ", ") or "none", db.secret.messages or 0))
   out("Full data: WTF/Account/<account>/SavedVariables/LayerProbe.lua (written on /reload or logout)")
 end
 
@@ -369,7 +729,7 @@ end
 local button
 local function makeButton()
   button = CreateFrame("Button", "LayerProbeScanButton", UIParent, "UIPanelButtonTemplate")
-  button:SetSize(120, 24)
+  button:SetSize(130, 24)
   button:SetPoint("TOP", 0, -120)
   button:SetText("Probe: scan")
   button:SetMovable(true)
@@ -381,14 +741,13 @@ local function makeButton()
 end
 
 local HELP = {
-  "/probe peer First Surname - add a friend to whisper-test with (/probe peer clear)",
-  "/probe scan - search the LFG tool now (tests slash-command permission)",
-  "/probe button - show/hide a Scan button (tests click permission)",
-  "/probe timerscan - search from a timer (expected to be blocked - that's the test)",
-  "/probe ping - send a ping on every route",
-  "/probe burst [n] - send n messages per route fast (default 20)",
-  "/probe api - list the LFG functions this client has",
-  "/probe report - summarize findings     /probe reset - wipe collected data",
+  "/probe dungeon [name|all] - list activities, or focus scans on one dungeon",
+  "/probe peer First Surname - add a friend for whisper tests (/probe peer clear)",
+  "/probe scan - search now (slash permission)   /probe button - Scan button (click permission)",
+  "/probe timerscan - search from a timer (expected to be blocked: that's the test)",
+  "/probe roster - try to read member lists of our channel and General (finding users)",
+  "/probe ping | burst [n] | rate <per-second> <seconds> - message route and throughput tests",
+  "/probe api - LFG functions on this client   /probe report - answers   /probe reset - wipe data",
 }
 
 local function slash(input)
@@ -397,18 +756,39 @@ local function slash(input)
   if cmd == "scan" then doSearch("slash")
   elseif cmd == "button" then button:SetShown(not button:IsShown())
   elseif cmd == "timerscan" then out("searching from a timer in 1s..."); C_Timer.After(1, function() doSearch("timer") end)
+  elseif cmd == "dungeon" then setDungeon(arg)
   elseif cmd == "ping" then ping("manual"); out("ping sent")
   elseif cmd == "burst" then burst(tonumber(arg) or 20)
+  elseif cmd == "rate" then
+    local perSec, secs = arg:match("^(%S+)%s+(%S+)$")
+    perSec, secs = tonumber(perSec) or 1, tonumber(secs) or 60
+    if count(db.peerTargets) == 0 then return out("add a peer first: /probe peer First Surname") end
+    rateTest(math.max(0.2, math.min(perSec, 10)), math.max(5, math.min(secs, 300)))
+  elseif cmd == "roster" then
+    requestRoster(CHANNEL)
+    C_Timer.After(12, function()
+      for i = 1, GetNumDisplayChannels and GetNumDisplayChannels() or 0 do
+        local ok, name, header = pcall(GetChannelDisplayInfo, i)
+        if ok and not header and type(name) == "string" and not isSecret(name) and name ~= CHANNEL then
+          requestRoster(name) -- the first public channel (usually General)
+          return
+        end
+      end
+    end)
   elseif cmd == "peer" then
     if arg == "clear" then wipe(db.peerTargets); out("peers cleared")
-    elseif arg ~= "" then db.peerTargets[arg] = true; out("will whisper-test with " .. arg); ping("hello")
-    else local p = {} for n in pairs(db.peerTargets) do p[#p + 1] = n end out("peers: " .. (#p > 0 and table.concat(p, ", ") or "none")) end
+    elseif arg ~= "" then db.peerTargets[arg] = true; out("will whisper-test with " .. arg); ping("manual")
+    else
+      local p = {} for n in pairs(db.peerTargets) do p[#p + 1] = n end
+      out("peers: " .. (#p > 0 and table.concat(p, ", ") or "none"))
+    end
   elseif cmd == "api" then
     local inv = inventory()
     out("C_LFGList: " .. (#inv.lfglist > 0 and table.concat(inv.lfglist, ", ") or "MISSING ENTIRELY"))
     local frames = {}
     for fr, present in pairs(inv.frames) do if present then frames[#frames + 1] = fr end end
     out("LFG frames present: " .. (#frames > 0 and table.concat(frames, ", ") or "none"))
+    out("activities in catalog: " .. #catalog())
   elseif cmd == "report" then report()
   elseif cmd == "reset" then LayerProbeDB = nil; ReloadUI()
   else for _, l in ipairs(HELP) do out(l) end end
@@ -422,18 +802,28 @@ local H = {}
 
 function H.ADDON_LOADED(name)
   if name ~= ADDON then return end
-  LayerProbeDB = LayerProbeDB or {}
+  if not LayerProbeDB or LayerProbeDB.schema ~= 3 then LayerProbeDB = { schema = 3 } end -- older data has another shape
   db = LayerProbeDB
-  for _, k in ipairs({ "log", "scans", "activities", "rawSamples", "routes", "crossLayer", "peerScans",
-                       "searchTests", "sendResults", "burstReceived", "peerTargets" }) do db[k] = db[k] or {} end
+  for _, k in ipairs({ "log", "scans", "rawSamples", "routes", "crossLayer", "peerScans", "peers", "searchTests",
+                       "searchLog", "sendResults", "rateSent", "rateReceived", "peerTargets", "lifecycle", "joins",
+                       "secret" }) do db[k] = db[k] or {} end
   db.layerStats = db.layerStats or { samples = 0, byMap = {} }
   db.layerStats.byMap = db.layerStats.byMap or {}
+  db.discovery = db.discovery or {}
+  db.discovery.rosters = db.discovery.rosters or {}
   local version, build, _, iface = GetBuildInfo()
   db.client = { version = version, build = build, interface = iface, realm = GetRealmName() }
   C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
   if C_LFGList and C_LFGList.Search then
     hooksecurefunc(C_LFGList, "Search", function(cat, _, _, _, _, _, acts)
-      log("search-hook", { category = cat, nActivities = type(acts) == "table" and #acts or 0, ours = pendingSearch ~= nil })
+      local ids = {}
+      if type(acts) == "table" then for _, a in ipairs(acts) do ids[#ids + 1] = tostring(a) end end
+      db.lastSearchActs = cat .. ":" .. table.concat(ids, ",")
+      if not pending or GetTime() - pending.at > 15 then -- Blizzard's own panel searched (or ours never answered)
+        local t = GetTime()
+        pending = { how = "blizzard-ui", at = t, gap = lastSearchAt and (t - lastSearchAt) or nil }
+        lastSearchAt = t
+      end
     end)
   end
   makeButton()
@@ -443,56 +833,63 @@ end
 
 function H.PLAYER_LOGIN()
   myName = getMyName()
+  myRealm = (GetNormalizedRealmName and GetNormalizedRealmName()) or (GetRealmName() or "?"):gsub("%s", "")
+  wasInGroup = IsInGroup() and true or false
   inventory()
   C_Timer.NewTicker(60, function() ping("auto") end)
-  out("loaded as " .. myName .. " - /probe for commands. Target an NPC so your layer is known.")
+  C_Timer.After(30, function() requestRoster(CHANNEL) end)
+  out("loaded as " .. myName .. "-" .. myRealm .. " - /probe for commands. Target an NPC so your layer is known.")
   if #db.inventory.missing > 0 then out("|cffff5555missing LFG functions:|r " .. table.concat(db.inventory.missing, ", ")) end
 end
 
 function H.PLAYER_ENTERING_WORLD()
   layer, layerMap = nil, nil
   C_Timer.After(5, function()
-    if GetChannelName(CHANNEL) == 0 then
-      local ok, err = pcall(JoinTemporaryChannel, CHANNEL)
-      log("channel-join", { ok = ok, err = err and tostring(err) })
-    end
+    joinChannel()
     for i = 1, NUM_CHAT_WINDOWS do local cf = _G["ChatFrame" .. i]; if cf then ChatFrame_RemoveChannel(cf, CHANNEL) end end
     C_Timer.After(2, function() ping("login") end)
+    if not db.catalog then catalog() end
   end)
 end
 
 function H.CHAT_MSG_CHANNEL_NOTICE(notice, _, _, _, _, _, _, _, channelName)
-  if not isSecret(notice, channelName) and channelName == CHANNEL then log("channel-notice", { notice = notice }) end
+  if isSecret(notice, channelName) or channelName ~= CHANNEL then return end
+  db.discovery.notices = db.discovery.notices or {}
+  table.insert(db.discovery.notices, { notice = notice, t = now() })
+  log("channel-notice", { notice = notice })
 end
 
+function H.CHANNEL_ROSTER_UPDATE(displayIndex, countArg) onRoster(displayIndex, countArg) end
 function H.PLAYER_TARGET_CHANGED() sample("target") end
 function H.UPDATE_MOUSEOVER_UNIT() sample("mouseover") end
 function H.NAME_PLATE_UNIT_ADDED(unit) sample(unit) end
 function H.ZONE_CHANGED_NEW_AREA() layer = nil; log("zone-change", { newMap = C_Map.GetBestMapForUnit("player") }) end
-function H.GROUP_ROSTER_UPDATE() log("group", { size = GetNumGroupMembers() }) end
+function H.GROUP_ROSTER_UPDATE() onGroupChanged() end
 function H.CHAT_MSG_ADDON(...) onAddonMessage(...) end
 
 function H.LFG_LIST_SEARCH_RESULTS_RECEIVED()
-  local how = pendingSearch and pendingSearch.how
+  local how = pending and pending.how
   if how and db.searchTests[how] then db.searchTests[how].results = db.searchTests[how].results + 1 end
   onResults()
 end
 
 function H.LFG_LIST_SEARCH_FAILED(reason)
-  local how = pendingSearch and pendingSearch.how or "blizzard-ui"
+  local how = pending and pending.how or "blizzard-ui"
   if db.searchTests[how] then db.searchTests[how].failed = db.searchTests[how].failed + 1 end
+  db.searchLog[#db.searchLog + 1] = { how = how, gap = pending and pending.gap, outcome = "failed", reason = tostring(reason), t = now() }
   log("search-failed", { how = how, reason = tostring(reason) })
   out("search failed (" .. how .. "): " .. tostring(reason))
-  pendingSearch = nil
+  pending = nil
 end
 
 local function blocked(event, addon, func)
   if addon ~= ADDON then return end
-  local how = pendingSearch and pendingSearch.how or "?"
+  local how = pending and pending.how or "?"
   if db.searchTests[how] then db.searchTests[how].blocked = db.searchTests[how].blocked + 1 end
+  db.searchLog[#db.searchLog + 1] = { how = how, gap = pending and pending.gap, outcome = "blocked", t = now() }
   log("blocked", { event = event, func = tostring(func), how = how })
   out(("|cffff5555%s|r: %s (via %s)"):format(event, tostring(func), how))
-  pendingSearch = nil
+  pending = nil
 end
 function H.ADDON_ACTION_BLOCKED(addon, func) blocked("ADDON_ACTION_BLOCKED", addon, func) end
 function H.ADDON_ACTION_FORBIDDEN(addon, func) blocked("ADDON_ACTION_FORBIDDEN", addon, func) end
@@ -500,8 +897,28 @@ function H.ADDON_ACTION_FORBIDDEN(addon, func) blocked("ADDON_ACTION_FORBIDDEN",
 function H.LFG_LIST_SEARCH_RESULT_UPDATED(id)
   local ok, info = pcall(C_LFGList.GetSearchResultInfo, id)
   if ok and type(info) == "table" and info.isDelisted == true then
+    local key = fullKey(info.leaderName)
+    if key and db.lifecycle[key] then db.lifecycle[key].delistedAt = now() end
     log("delisted", { leader = describeString(info.leaderName), age = copy(info.age) })
   end
+end
+
+-- Q8: can we read our own listing (needed to auto-publish it)?
+function H.LFG_LIST_ACTIVE_ENTRY_UPDATE()
+  local own = db.ownEntry or { updates = 0 }
+  own.updates = own.updates + 1
+  local okHas, has = pcall(C_LFGList.HasActiveEntryInfo)
+  own.has = okHas and copy(has) or "error"
+  if okHas and has == true then
+    local ok, e = pcall(C_LFGList.GetActiveEntryInfo)
+    own.readable = ok and type(e) == "table"
+    if own.readable then
+      own.activities = isSecret(e.activityIDs) and "secret" or (type(e.activityIDs) == "table" and #e.activityIDs or 0)
+      own.sample = copy(e)
+    end
+    own.lockdown = lockdown()
+  end
+  db.ownEntry = own
 end
 
 f:SetScript("OnEvent", function(_, event, ...) H[event](...) end)

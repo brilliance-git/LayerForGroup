@@ -1,0 +1,12 @@
+## Interface: 11509
+## Title: LayerLink
+## Notes: One realm-wide LFG board. Every LayerLink user shares what the LFG tool shows on their layer.
+## Version: 0.2.0
+## SavedVariables: LayerLinkDB
+
+Dungeons.lua
+Board.lua
+Comm.lua
+Layer.lua
+UI.lua
+Core.lua

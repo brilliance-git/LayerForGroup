@@ -930,10 +930,13 @@ onRemote = function(msg, sender)
   if not n or not who then return end
   local realm = who:match("%-([^%-]+)$") or myRealm
   local rs = db.remote[who]
-  if not rs or now() - rs.t > 120 then
+  -- a new run starts when the previous one finished (result set) or went quiet; otherwise a
+  -- second click of the Send macro would pile its ids onto the first run's
+  if not rs or rs.result or now() - (rs.last or rs.t) > 20 then
     rs = { by = who, realm = realm, n = tonumber(n), t = now(), ids = {}, target = db.target and db.target.query }
     db.remote[who] = rs
   end
+  rs.last = now()
   for id in ids:gmatch("[^,]+") do rs.ids[id] = true end
   if count(rs.ids) < rs.n then return end -- more chunks to come
   -- compare with my latest complete scan, ideally a snapshot, from the last 10 minutes

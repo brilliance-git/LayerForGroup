@@ -1,7 +1,7 @@
-## Interface: 11509
+## Interface: 16001
 ## Title: LayerProbe
-## Notes: Fact-finding for LayerLink: is the LFG tool per-layer, does a custom channel cross layers, what can addons read?
-## Version: 0.1.0
+## Notes: Fact-finding for LayerLink on WoW: Forever: can addons read the LFG tool, is it per-layer, which message routes cross layers?
+## Version: 0.2.0
 ## SavedVariables: LayerProbeDB
 
 LayerProbe.lua

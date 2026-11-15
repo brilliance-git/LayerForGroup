@@ -1,0 +1,7 @@
+## Interface: 11509
+## Title: LayerProbe
+## Notes: Fact-finding for LayerLink: is the LFG tool per-layer, does a custom channel cross layers, what can addons read?
+## Version: 0.1.0
+## SavedVariables: LayerProbeDB
+
+LayerProbe.lua

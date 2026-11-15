@@ -20,6 +20,12 @@ for name, key in pairs({
   ["Blackrock Depths"] = "BRD", ["Stratholme - Undead District"] = "STRATUD", ["Stratholme - Live"] = "STRATLIVE",
   ["The Deadmines"] = "VC", ["Upper Blackrock Spire"] = "UBRS", ["Molten Core"] = "MC", ["Zul'Gurub"] = "ZG",
   ["Onyxia's Lair"] = "ONY", ["Strat UD"] = "STRATUD", ["brd"] = "BRD",
+  ["Scarlet Armory"] = "SMARM", ["Scarlet Graveyard"] = "SMGY", ["Scarlet Library"] = "SMLIB",
+  ["Scarlet Cathedral"] = "SMCATH", ["Scarlet Monastery"] = "SM", ["Dire Maul - Warpwood Quarter"] = "DME",
+  ["Dire Maul - Capital Gardens"] = "DMW", ["Dire Maul - Gordok Commons"] = "DMN", ["Dire Maul"] = "DIREMAUL",
+  ["Stratholme - Service Entrance"] = "STRATUD", ["Stratholme - Main Gate"] = "STRATLIVE", ["Stratholme"] = "STRAT",
+  ["Blackrock Spire - Lower"] = "LBRS", ["The Temple of Atal'Hakkar"] = "ST", ["Ruins of Ahn'Qiraj"] = "AQ20",
+  ["Ahn'Qiraj Temple"] = "AQ40",
 }) do
   test("activity " .. name, function() eq(ns.MatchDungeon(name), key) end)
 end

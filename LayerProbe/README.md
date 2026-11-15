@@ -24,6 +24,27 @@ answers each question in `/probe report`.
 | Layers | Q12 | How do layers behave? | Zone ids per map, and **seconds from joining a group to changing layer** |
 | | Q13 | When does data go secret? | Secret fields per scan with instance and chat-lockdown flags |
 
+## Realm snapshot (one command, anyone can do it)
+
+Tests whether each realm's LFG tool shows only its own players. Players on **different realms** each:
+
+```
+/probe snapshot <dungeon>      e.g. /probe snapshot armory - shows a "Take snapshot" button
+```
+
+Target an NPC, then click **Take snapshot** (searching needs a click). A window opens with the text
+already selected. Press Cmd+C (Mac) or Ctrl+C and paste it anywhere: Discord, a file, a chat. If
+the last line says some names weren't loaded, click again ~5 s later.
+
+Take the snapshots within a few minutes of each other, for the same dungeon. Then compare:
+
+```
+python3 tools/compare_snapshots.py realm5.txt realm2.txt ...
+```
+
+It reports the shared % per pair (same realm = control, other realm = the question) and how much
+bigger a merged list would be. Each listing carries its party ID, so listings match even without names.
+
 ## Quick two-player test (~10 minutes)
 
 Both players, with your layers on different zone copies (or in different zones):

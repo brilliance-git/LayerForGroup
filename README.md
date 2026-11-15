@@ -11,3 +11,5 @@ Two WoW Classic Era addons:
 Install: copy a folder into `World of Warcraft/_classic_era_/Interface/AddOns/`.
 
 Tests: `cd LayerLink && lua5.1 tests/run.lua`
+
+Compare realm snapshots from LayerProbe: `python3 tools/compare_snapshots.py snap1.txt snap2.txt`

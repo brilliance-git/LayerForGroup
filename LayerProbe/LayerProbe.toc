@@ -1,7 +1,7 @@
 ## Interface: 16001
 ## Title: LayerProbe
 ## Notes: Fact-finding for a cross-layer LFG list on WoW: Forever: what the LFG tool shows, how addons can share it, how layers behave.
-## Version: 0.3.1
+## Version: 0.4.0
 ## SavedVariables: LayerProbeDB
 
 LayerProbe.lua

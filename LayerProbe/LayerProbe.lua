@@ -22,6 +22,7 @@ local PREFIX, CHANNEL = "LProbe", "LayerProbeNet"
 local db
 local myName, myRealm, layer, layerMap = nil, nil, nil, nil
 local pending -- the search in flight: { how, at, gap }
+local showSnapshot -- defined with the snapshot window below
 local lastSearchAt
 
 ---------------------------------------------------------------------------
@@ -473,7 +474,7 @@ local function onResults()
   for i, id in ipairs(results) do
     local r, acts, n = readResult(id, scan)
     if r then
-      if i <= 80 then scan.results[#scan.results + 1] = r end
+      if i <= 100 then scan.results[#scan.results + 1] = r end
       local kind = n == 1 and "S" or "G"
       if kind == "S" then scan.solo = scan.solo + 1 else scan.groups = scan.groups + 1 end
       local act = tonumber(acts[1]) or 0
@@ -509,6 +510,7 @@ local function onResults()
     scan.churn = { gone = gone, of = count(prev.items), seconds = scan.t - prev.t }
   end
   table.insert(db.scans, scan)
+  if scan.how == "snapshot" and showSnapshot then showSnapshot(scan) end
   if #db.scans > 150 then table.remove(db.scans, 1) end
   out(("scan: %d results (%d groups, %d solo) on layer %s in %s via %s%s"):format(#results, scan.groups, scan.solo,
     tostring(layer), zone, scan.how, scan.complete and "" or " |cffffff00(capped at 100: narrow it with /probe dungeon)|r"))
@@ -789,8 +791,110 @@ local function makeButton()
   button:Hide()
 end
 
+---------------------------------------------------------------------------
+-- Snapshot: one search for one dungeon, as plain text anyone can paste. Snapshots taken on
+-- different realms are compared with tools/compare_snapshots.py in the repo.
+---------------------------------------------------------------------------
+local snapButton, snapFrame
+
+local function remaining(mc, role)
+  if type(mc) ~= "table" then return 0 end
+  return tonumber(mc[role .. "_REMAINING"]) or 0
+end
+
+local function snapshotText(scan)
+  local lines = {}
+  local faction = UnitFactionGroup and UnitFactionGroup("player")
+  lines[#lines + 1] = ("LFGSNAP v1 | realm=%s | faction=%s | build=%s | utc=%s | t=%d | layer=%s | map=%s | zone=%s"):format(
+    tostring(myRealm), tostring(not isSecret(faction) and faction or "?"), tostring(db.client.build),
+    date("!%Y-%m-%d %H:%M:%S", scan.t), scan.t, tostring(scan.layer), tostring(scan.map), tostring(scan.zone))
+  lines[#lines + 1] = ("activity=%s | total=%s | shown=%d | complete=%s"):format(
+    db.target and table.concat(db.target.names, " + ") or "whole category", tostring(scan.total), scan.n,
+    scan.complete and "yes" or "NO (capped at 100 - pick a narrower dungeon)")
+  lines[#lines + 1] = "party | leader-realm | members | needs (T/H/D) or solo roles | level | class | leader zone | listed"
+  local named, unnamed = 0, 0
+  for _, r in ipairs(scan.results) do
+    local leader
+    for _, m in pairs(r.members) do if type(m) == "table" and (m.isLeader or r.numMembers == 1) then leader = m end end
+    local needs
+    if r.numMembers == 1 then
+      local lr = leader and leader.lfgRoles
+      needs = "solo:" .. (type(lr) == "table" and ((lr.tank and "T" or "") .. (lr.healer and "H" or "") .. (lr.dps and "D" or "")) or "?")
+    else
+      needs = ("%d/%d/%d"):format(remaining(r.memberCounts, "TANK"), remaining(r.memberCounts, "HEALER"), remaining(r.memberCounts, "DAMAGER"))
+    end
+    if r.key then named = named + 1 else unnamed = unnamed + 1 end
+    local listed = tonumber(r.age)
+    lines[#lines + 1] = ("%s | %s | %s | %s | %s | %s | %s | %s"):format(
+      (tostring(r.id or "?"):gsub("^Party%-", "")), r.key or "(name not loaded)", tostring(r.numMembers), needs,
+      tostring(leader and leader.level or "?"), tostring(leader and leader.class or "?"), tostring(r.leaderArea or "?"),
+      listed and (math.floor(listed / 60) .. "m") or "?")
+  end
+  lines[#lines + 1] = ("END | %d listings, %d without a loaded name%s"):format(#scan.results, unnamed,
+    unnamed > 0 and " (click Take snapshot again in ~5 s to fill them in)" or "")
+  return table.concat(lines, "\n")
+end
+
+local function makeSnapFrame()
+  snapFrame = CreateFrame("Frame", "LayerProbeSnapshotFrame", UIParent, "BasicFrameTemplateWithInset")
+  snapFrame:SetSize(640, 380)
+  snapFrame:SetPoint("CENTER")
+  snapFrame:SetMovable(true)
+  snapFrame:EnableMouse(true)
+  snapFrame:RegisterForDrag("LeftButton")
+  snapFrame:SetScript("OnDragStart", snapFrame.StartMoving)
+  snapFrame:SetScript("OnDragStop", snapFrame.StopMovingOrSizing)
+  tinsert(UISpecialFrames, "LayerProbeSnapshotFrame")
+  local title = snapFrame.TitleText or snapFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+  if not snapFrame.TitleText then title:SetPoint("TOP", 0, -5) end
+  title:SetText("LayerProbe snapshot - press Ctrl+C (Cmd+C on Mac), then paste it anywhere")
+  local scroll = CreateFrame("ScrollFrame", nil, snapFrame, "UIPanelScrollFrameTemplate")
+  scroll:SetPoint("TOPLEFT", 12, -30)
+  scroll:SetPoint("BOTTOMRIGHT", -32, 12)
+  local edit = CreateFrame("EditBox", nil, scroll)
+  edit:SetMultiLine(true)
+  edit:SetFontObject("ChatFontSmall")
+  edit:SetWidth(590)
+  edit:SetAutoFocus(false)
+  edit:SetScript("OnEscapePressed", function() snapFrame:Hide() end)
+  edit:SetScript("OnTextChanged", function(self, user) if user then self:SetText(self.text or "") self:HighlightText() end end)
+  scroll:SetScrollChild(edit)
+  snapFrame.edit = edit
+end
+
+showSnapshot = function(scan)
+  if not snapFrame then makeSnapFrame() end
+  local text = snapshotText(scan)
+  db.lastSnapshot = text
+  snapFrame.edit.text = text
+  snapFrame.edit:SetText(text)
+  snapFrame:Show()
+  snapFrame.edit:SetFocus()
+  snapFrame.edit:HighlightText()
+  out(("snapshot ready: %d listings for %s"):format(#scan.results, db.target and db.target.query or "the category"))
+end
+
+local function snapshot(arg)
+  if arg ~= "" then setDungeon(arg) end
+  if not db.target then return out("pick a dungeon: /probe snapshot <name>   (/probe dungeon lists them)") end
+  if not snapButton then
+    snapButton = CreateFrame("Button", "LayerProbeSnapshotButton", UIParent, "UIPanelButtonTemplate")
+    snapButton:SetSize(200, 28)
+    snapButton:SetPoint("TOP", 0, -150)
+    snapButton:SetMovable(true)
+    snapButton:RegisterForDrag("LeftButton")
+    snapButton:SetScript("OnDragStart", snapButton.StartMoving)
+    snapButton:SetScript("OnDragStop", snapButton.StopMovingOrSizing)
+    snapButton:SetScript("OnClick", function() doSearch("snapshot") end) -- a click: the game allows the search
+  end
+  snapButton:SetText("Take snapshot: " .. db.target.query)
+  snapButton:Show()
+  out("click |cff33ff99Take snapshot|r (searching needs a click). Target an NPC first so your layer is included.")
+end
+
 local HELP = {
   "/probe dungeon [name|all] - list activities, or focus scans on one dungeon",
+  "/probe snapshot <dungeon> - one search as copyable text, to compare realms",
   "/probe duo First Surname - quick two-player test with a friend (prints the steps)",
   "/probe peer First Surname - add a friend for whisper tests (/probe peer clear)",
   "/probe scan - search now (slash permission)   /probe button - Scan button (click permission)",
@@ -825,6 +929,7 @@ local function slash(input)
         end
       end
     end)
+  elseif cmd == "snapshot" then snapshot(arg)
   elseif cmd == "duo" then
     if arg == "" then return out("usage: /probe duo First Surname   (your friend's full name)") end
     wipe(db.peerTargets)

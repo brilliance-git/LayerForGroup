@@ -243,10 +243,26 @@ local function sendAll(msg, tag, whisperOnly)
   for name in pairs(db.peerTargets) do sendOne(msg, "WHISPER", name, tag) end
 end
 
+-- Scan sharing goes only to peers by whisper, paced under the addon-message throttle
+-- (the first solo run saw ~70% of unpaced sends come back AddonMessageThrottle).
+local outQueue, lastOut = {}, 0
+local function pumpQueue()
+  if #outQueue == 0 or GetTime() - lastOut < 1.2 then return end
+  local m = table.remove(outQueue, 1)
+  lastOut = GetTime()
+  sendOne(m.msg, "WHISPER", m.target)
+end
+
 local function sendChunks(head, items)
+  if not next(db.peerTargets) then return end -- nobody to compare with
   local buf = {}
   local function flush()
-    if #buf > 0 then sendAll(head .. "^" .. table.concat(buf, ",")); buf = {} end
+    if #buf > 0 then
+      for name in pairs(db.peerTargets) do
+        if #outQueue < 60 then outQueue[#outQueue + 1] = { msg = head .. "^" .. table.concat(buf, ","), target = name } end
+      end
+      buf = {}
+    end
   end
   for _, s in ipairs(items) do
     if #head + #table.concat(buf, ",") + #s + 2 > 240 then flush() end
@@ -318,11 +334,11 @@ local function onAddonMessage(prefix, msg, dist, sender)
       db.rateReceived[k] = r
     end
   elseif f[1] == "S" then
-    -- S^layer^time^map^realm^n ^ items "Name-Realm@activityID@G|S"
+    -- S^layer^time^map^realm^n^complete^searchSig ^ items "partyID@activityID@G|S"
     local key = whisperName .. "@" .. (f[3] or "")
     local ps = db.peerScans[key] or { by = whisperName, layer = theirLayer, t = tonumber(f[3]), map = f[4],
-                                      realm = f[5], n = tonumber(f[6]), items = {} }
-    for item in (f[7] or ""):gmatch("[^,]+") do
+                                      realm = f[5], n = tonumber(f[6]), complete = f[7] == "1", sig = f[8], items = {} }
+    for item in (f[9] or ""):gmatch("[^,]+") do
       local who, act, kind = item:match("^(.-)@(%d+)@([GS])$")
       if who then ps.items[who] = { act = tonumber(act), kind = kind } end
     end
@@ -406,6 +422,9 @@ local function readResult(id, scan)
   local n = tonumber(not isSecret(info.numMembers) and info.numMembers) or 0
   local r = {
     leader = describeString(info.leaderName), key = fullKey(info.leaderName), numMembers = copy(info.numMembers),
+    -- partyGUID is present even when the leader's name hasn't loaded yet (46% of first sightings)
+    id = (not isSecret(info.partyGUID) and type(info.partyGUID) == "string" and info.partyGUID ~= "" and info.partyGUID)
+      or fullKey(info.leaderName),
     age = copy(info.age), isDelisted = copy(info.isDelisted), activityIDs = copy(acts), hasSelf = copy(info.hasSelf),
     playstyle = copy(info.playstyle), generalPlaystyle = copy(info.generalPlaystyle), autoAccept = copy(info.autoAccept),
     name = describeString(info.name), comment = describeString(info.comment), members = {},
@@ -446,7 +465,9 @@ local function onResults()
   end
   local zone = GetRealZoneText and GetRealZoneText() or "?"
   local scan = { t = now(), layer = layer, map = layerMap, zone = zone, realm = myRealm, total = copy(total), n = #results,
-                 how = p and p.how or "blizzard-ui", searched = db.lastSearchActs, lockdown = lockdown(),
+                 how = p and p.how or "blizzard-ui", searched = db.lastSearchActs, sig = db.lastSearchSig,
+                 complete = (tonumber(not isSecret(total) and total) or 0) == #results and #results < 100,
+                 lockdown = lockdown(),
                  results = {}, items = {}, secretFields = {}, realms = {}, sameZone = 0, otherZone = 0,
                  unknownZone = 0, groups = 0, solo = 0, byActivity = {} }
   for i, id in ipairs(results) do
@@ -460,12 +481,16 @@ local function onResults()
       if kind == "S" then ba.solo = ba.solo + 1 else ba.groups = ba.groups + 1 end
       scan.byActivity[act] = ba
       if r.key then
-        scan.items[r.key] = { act = act, kind = kind }
         local realm = realmOf(r.key) or "?"
         scan.realms[realm] = (scan.realms[realm] or 0) + 1
-        local life = db.lifecycle[r.key] or { first = scan.t, scans = 0 }
+      else
+        scan.noName = (scan.noName or 0) + 1
+      end
+      if r.id then
+        scan.items[r.id] = { act = act, kind = kind }
+        local life = db.lifecycle[r.id] or { first = scan.t, scans = 0 }
         life.last, life.scans = scan.t, life.scans + 1
-        db.lifecycle[r.key] = life
+        db.lifecycle[r.id] = life
       end
       if not r.leaderArea then scan.unknownZone = scan.unknownZone + 1
       elseif r.leaderArea == zone then scan.sameZone = scan.sameZone + 1
@@ -485,11 +510,14 @@ local function onResults()
   end
   table.insert(db.scans, scan)
   if #db.scans > 150 then table.remove(db.scans, 1) end
-  out(("scan: %d results (%d groups, %d solo) on layer %s in %s via %s"):format(#results, scan.groups, scan.solo,
-    tostring(layer), zone, scan.how))
-  local items = {}
-  for k, v in pairs(scan.items) do items[#items + 1] = k .. "@" .. v.act .. "@" .. v.kind end
-  sendChunks(("S^%s^%d^%s^%s^%d"):format(layer or "", scan.t, layerMap or "", myRealm or "", #items), items)
+  out(("scan: %d results (%d groups, %d solo) on layer %s in %s via %s%s"):format(#results, scan.groups, scan.solo,
+    tostring(layer), zone, scan.how, scan.complete and "" or " |cffffff00(capped at 100: narrow it with /probe dungeon)|r"))
+  -- only complete scans are comparable: a capped search returns a different 100 each time
+  if scan.complete then
+    local items = {}
+    for k, v in pairs(scan.items) do items[#items + 1] = k .. "@" .. v.act .. "@" .. v.kind end
+    sendChunks(("S^%s^%d^%s^%s^%d^1^%s"):format(layer or "", scan.t, layerMap or "", myRealm or "", #items, scan.sig or ""), items)
+  end
 end
 
 ---------------------------------------------------------------------------
@@ -510,11 +538,12 @@ local function doSearch(how)
   local t = GetTime()
   pending = { how = how, at = t, gap = lastSearchAt and (t - lastSearchAt) or nil }
   lastSearchAt = t
-  local ok, err = pcall(C_LFGList.Search, cat, 0, 0, nil, false, nil, acts)
-  log("search-call", { how = how, ok = ok, err = err and tostring(err), category = cat, nActivities = acts and #acts })
+  -- create the counter first: a blocked call reports ADDON_ACTION_BLOCKED from inside Search itself
   db.searchTests[how] = db.searchTests[how] or { calls = 0, results = 0, blocked = 0, failed = 0, errors = 0 }
   local s = db.searchTests[how]
   s.calls = s.calls + 1
+  local ok, err = pcall(C_LFGList.Search, cat, 0, 0, nil, false, nil, acts)
+  log("search-call", { how = how, ok = ok, err = err and tostring(err), category = cat, nActivities = acts and #acts })
   if not ok then
     s.errors = s.errors + 1
     db.searchLog[#db.searchLog + 1] = { how = how, gap = pending.gap, outcome = "error", t = now() }
@@ -557,31 +586,47 @@ local function targetSet()
   return next(set) and set or nil
 end
 
--- Cross-layer comparison of own scans with peer scans taken within 3 minutes on another layer.
+-- Compare own scans with a peer's scans of the SAME search taken within 3 minutes. Only complete
+-- scans count (a search capped at 100 returns a different random 100 each time). Each pair is
+-- classed: "control" (same layer and realm: should be ~100% alike), "layer" (other layer or zone,
+-- same realm: Q1) or "realm" (other realm: Q2).
 local function compare()
-  local res = { pairs = 0, shared = 0, union = 0, mine = 0, tMine = 0, tUnion = 0, tPairs = 0 }
-  local tset = targetSet()
+  local res = {}
+  for _, kind in ipairs({ "control", "layer", "realm" }) do
+    res[kind] = { pairs = 0, shared = 0, union = 0, mine = 0, unknownLayer = 0 }
+  end
   for _, mine in ipairs(db.scans) do
     for _, theirs in pairs(db.peerScans) do
-      if mine.layer and theirs.layer ~= "" and tonumber(theirs.layer) ~= mine.layer
-         and math.abs((theirs.t or 0) - mine.t) <= 180 and count(theirs.items) > 0 and count(mine.items) > 0 then
-        res.pairs = res.pairs + 1
-        local u, tu, tm = {}, {}, 0
-        for k, v in pairs(mine.items) do
-          u[k] = true
-          if tset and tset[v.act] then tu[k] = true; tm = tm + 1 end
+      if mine.complete and theirs.complete and mine.sig and mine.sig == theirs.sig
+         and math.abs((theirs.t or 0) - mine.t) <= 180 and (count(theirs.items) > 0 or count(mine.items) > 0) then
+        local kind
+        if theirs.realm ~= "" and theirs.realm ~= mine.realm then kind = "realm"
+        elseif mine.layer and theirs.layer ~= "" and (tonumber(theirs.layer) ~= mine.layer or theirs.map ~= tostring(mine.map)) then kind = "layer"
+        elseif mine.layer and theirs.layer ~= "" then kind = "control"
         end
-        for k, v in pairs(theirs.items) do
-          if mine.items[k] then res.shared = res.shared + 1 end
-          u[k] = true
-          if tset and tset[v.act] then tu[k] = true end
+        if kind then
+          local r, u = res[kind], {}
+          r.pairs = r.pairs + 1
+          for k in pairs(mine.items) do u[k] = true end
+          for k in pairs(theirs.items) do
+            if mine.items[k] then r.shared = r.shared + 1 end
+            u[k] = true
+          end
+          r.union, r.mine = r.union + count(u), r.mine + count(mine.items)
+        else
+          res.layer.unknownLayer = res.layer.unknownLayer + 1 -- one side's layer unknown: target an NPC
         end
-        res.union, res.mine = res.union + count(u), res.mine + count(mine.items)
-        if tset then res.tPairs, res.tMine, res.tUnion = res.tPairs + 1, res.tMine + tm, res.tUnion + count(tu) end
       end
     end
   end
   return res
+end
+
+local function compareLine(label, r, verdictLow, verdictHigh)
+  if r.pairs == 0 then return out(label .. ": no matching scan pairs yet") end
+  local pct = r.union > 0 and math.floor(100 * r.shared / r.union) or 100
+  out(("%s: %d scan pairs, %d%% of listings shared, merged list %.1fx your own -> %s"):format(label, r.pairs, pct,
+    r.mine > 0 and r.union / r.mine or 1, pct >= 80 and verdictHigh or pct <= 30 and verdictLow or "mixed - scan more"))
 end
 
 local function report()
@@ -593,15 +638,10 @@ local function report()
   out("     lfg addons: " .. (#addons > 0 and table.concat(addons, " ") or "none found"))
 
   local c = compare()
-  if c.pairs == 0 then
-    out("TOOL Q1 layers: no scan pairs from different layers within 3 min yet (scan together with a peer)")
-  else
-    local pct = c.union > 0 and math.floor(100 * c.shared / c.union) or 0
-    out(("TOOL Q1 layers: %d cross-layer scan pairs, %d%% of listings shared -> %s"):format(c.pairs, pct,
-      pct < 15 and "|cff33ff99tool is layer-limited: merging helps|r"
-      or pct > 70 and "|cffff5555tool already shows all layers|r" or "mixed - collect more"))
-    out(("     merged list is %.1fx your own view on average"):format(c.mine > 0 and c.union / c.mine or 0))
-  end
+  compareLine("TOOL Q1 control (same layer)", c.control, "|cffff5555differs even on one layer: check timing|r", "|cff33ff99method works|r")
+  compareLine("TOOL Q1 other layer/zone", c.layer, "|cff33ff99tool is layer-limited: merging helps|r", "|cffff5555tool shows every layer|r")
+  if c.layer.unknownLayer > 0 then out(("     %d pairs skipped: a layer was unknown (target an NPC)"):format(c.layer.unknownLayer)) end
+  compareLine("TOOL Q2 other realm", c.realm, "|cff33ff99tool is realm-limited: merging realms helps|r", "|cffff5555tool shows other realms too|r")
 
   local realms, keys, foreign = {}, 0, 0
   for _, s in ipairs(db.scans) do
@@ -625,6 +665,11 @@ local function report()
     end
   else
     out("TOOL Q4 fields: no scans yet - open the LFG tool and refresh, or /probe scan")
+  end
+  local noName, seenN = 0, 0
+  for _, s in ipairs(db.scans) do noName, seenN = noName + (s.noName or 0), seenN + s.n end
+  if seenN > 0 then
+    out(("     leader name not loaded yet: %d%% of results (listings still tracked by party id)"):format(math.floor(100 * noName / seenN)))
   end
 
   for how, t in pairs(db.searchTests) do
@@ -657,9 +702,13 @@ local function report()
     end
     out(("TOOL Q7 %s: %d scans with it, avg %.1f groups + %.1f solo per scan"):format(db.target.query, scans,
       scans > 0 and g / scans or 0, scans > 0 and s / scans or 0))
-    if c.tPairs > 0 then
-      out(("     merged with other layers: %.1f -> %.1f listings per scan (%.1fx)"):format(c.tMine / c.tPairs,
-        c.tUnion / c.tPairs, c.tMine > 0 and c.tUnion / c.tMine or 0))
+    local m = { pairs = 0, mine = 0, union = 0 }
+    for _, kind in ipairs({ "layer", "realm" }) do
+      m.pairs, m.mine, m.union = m.pairs + c[kind].pairs, m.mine + c[kind].mine, m.union + c[kind].union
+    end
+    if m.pairs > 0 then
+      out(("     merged with your peer: %.1f -> %.1f listings per scan (%.1fx)"):format(m.mine / m.pairs,
+        m.union / m.pairs, m.mine > 0 and m.union / m.mine or 1))
     end
   else
     out("TOOL Q7 dungeon: no target - /probe dungeon <name> to focus on one")
@@ -742,6 +791,7 @@ end
 
 local HELP = {
   "/probe dungeon [name|all] - list activities, or focus scans on one dungeon",
+  "/probe duo First Surname - quick two-player test with a friend (prints the steps)",
   "/probe peer First Surname - add a friend for whisper tests (/probe peer clear)",
   "/probe scan - search now (slash permission)   /probe button - Scan button (click permission)",
   "/probe timerscan - search from a timer (expected to be blocked: that's the test)",
@@ -775,6 +825,19 @@ local function slash(input)
         end
       end
     end)
+  elseif cmd == "duo" then
+    if arg == "" then return out("usage: /probe duo First Surname   (your friend's full name)") end
+    wipe(db.peerTargets)
+    db.peerTargets[arg] = true
+    button:Show()
+    ping("manual")
+    out("|cff33ff99duo test with " .. arg .. "|r - both players:")
+    out("  1. target any NPC (so your layer is known)")
+    out("  2. " .. (db.target and ("dungeon is set: " .. db.target.query .. " - your friend must pick the same")
+      or "|cffffff00pick the SAME dungeon as your friend: /probe dungeon <name>|r"))
+    out("  3. click the Scan button together, 5 times, ~30 s apart")
+    out("  4. one invites the other, the invited one keeps mousing over NPCs (layer timing)")
+    out("  5. /probe report, then /reload and send LayerProbe.lua")
   elseif cmd == "peer" then
     if arg == "clear" then wipe(db.peerTargets); out("peers cleared")
     elseif arg ~= "" then db.peerTargets[arg] = true; out("will whisper-test with " .. arg); ping("manual")
@@ -819,6 +882,8 @@ function H.ADDON_LOADED(name)
       local ids = {}
       if type(acts) == "table" then for _, a in ipairs(acts) do ids[#ids + 1] = tostring(a) end end
       db.lastSearchActs = cat .. ":" .. table.concat(ids, ",")
+      table.sort(ids)
+      db.lastSearchSig = cat .. "." .. table.concat(ids, "."):sub(1, 60)
       if not pending or GetTime() - pending.at > 15 then -- Blizzard's own panel searched (or ours never answered)
         local t = GetTime()
         pending = { how = "blizzard-ui", at = t, gap = lastSearchAt and (t - lastSearchAt) or nil }
@@ -837,6 +902,7 @@ function H.PLAYER_LOGIN()
   wasInGroup = IsInGroup() and true or false
   inventory()
   C_Timer.NewTicker(60, function() ping("auto") end)
+  C_Timer.NewTicker(0.3, pumpQueue)
   C_Timer.After(30, function() requestRoster(CHANNEL) end)
   out("loaded as " .. myName .. "-" .. myRealm .. " - /probe for commands. Target an NPC so your layer is known.")
   if #db.inventory.missing > 0 then out("|cffff5555missing LFG functions:|r " .. table.concat(db.inventory.missing, ", ")) end
@@ -908,7 +974,7 @@ function H.LFG_LIST_ACTIVE_ENTRY_UPDATE()
   local own = db.ownEntry or { updates = 0 }
   own.updates = own.updates + 1
   local okHas, has = pcall(C_LFGList.HasActiveEntryInfo)
-  own.has = okHas and copy(has) or "error"
+  if okHas then own.has = copy(has) else own.has = "error: " .. tostring(has) end
   if okHas and has == true then
     local ok, e = pcall(C_LFGList.GetActiveEntryInfo)
     own.readable = ok and type(e) == "table"

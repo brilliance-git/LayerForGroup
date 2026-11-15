@@ -24,7 +24,21 @@ answers each question in `/probe report`.
 | Layers | Q12 | How do layers behave? | Zone ids per map, and **seconds from joining a group to changing layer** |
 | | Q13 | When does data go secret? | Secret fields per scan with instance and chat-lockdown flags |
 
-## Test plan (~30 minutes, two players)
+## Quick two-player test (~10 minutes)
+
+Both players, with your layers on different zone copies (or in different zones):
+
+```
+/probe dungeon <name>          both pick the SAME dungeon, ideally a busy one
+/probe duo First Surname       the other player's full name; prints these steps
+```
+
+Then target any NPC, click the **Scan** button together 5 times about 30 s apart, have one player
+invite the other (the invited one keeps mousing over NPCs), and finish with `/probe report` and
+`/reload`. Only complete searches (under 100 results) are compared, because a capped search returns
+a different 100 each time. That's why a single dungeon is needed.
+
+## Full test plan (~30 minutes, two players)
 
 You need **two players on different layers**: same realm type and faction, ideally the same guild
 (it tests the guild route too). A friend or a second account works.

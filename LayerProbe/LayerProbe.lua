@@ -958,8 +958,13 @@ onRemote = function(msg, sender)
   end
   local u, m = count(union), count(mine.items)
   rs.result = { shared = shared, theirs = rs.n, mine = m, union = u, sameRealm = realm == myRealm, myScanT = mine.t }
-  out(("|cff33ff99%s|r (%s): %d listings, %d shared with your %d -> merged list %d (%.1fx yours)%s"):format(who, realm,
-    rs.n, shared, m, u, m > 0 and u / m or 0, realm == myRealm and " [same realm: control]" or ""))
+  -- the Send macro sends whatever the friend's LAST search returned: if they skipped the Search
+  -- macro (or searched something else), the ids belong to another search and share nothing
+  local suspect = m > 0 and shared == 0 and (realm == myRealm or rs.n > 3 * m)
+  rs.result.suspect = suspect or nil
+  out(("|cff33ff99%s|r (%s): %d listings, %d shared with your %d -> merged list %d (%.1fx yours)%s%s"):format(who, realm,
+    rs.n, shared, m, u, m > 0 and u / m or 0, realm == myRealm and " [same realm: control]" or "",
+    suspect and " |cffffff00- looks like Send without Search (or a different search): ignore, ask them to click Search, wait 3 s, then Send|r" or ""))
 end
 
 function snapshot(arg)

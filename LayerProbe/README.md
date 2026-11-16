@@ -24,6 +24,13 @@ answers each question in `/probe report`.
 | Layers | Q12 | How do layers behave? | Zone ids per map, and **seconds from joining a group to changing layer** |
 | | Q13 | When does data go secret? | Secret fields per scan with instance and chat-lockdown flags |
 
+## Who to ask: `/probe realms`
+
+Lists players on OTHER realms in your channels' member lists, your guild and your friends list
+(their names carry a "-Realm" suffix), with a few names per realm. Same-realm players see the same
+LFG list as you (measured twice), so only other-realm players are worth asking. If it finds nobody,
+realms may not mix in the world.
+
 ## Realm test with friends who DON'T have the addon (recommended)
 
 You run the probe. Your friends only paste two chat lines, nothing installed.
@@ -31,8 +38,9 @@ You run the probe. Your friends only paste two chat lines, nothing installed.
 1. You: `/probe macros <dungeon>` (e.g. `/probe macros armory`). A window opens with instructions and
    two `/run` lines, already filled in with the dungeon and your name. Copy it (Cmd+C) and send it to
    friends on other realms (same faction), e.g. on Discord.
-2. Friends: paste line 1 in the chat box, Enter (searches the LFG tool). Wait 3 s, paste line 2,
-   Enter (sends the results to you as invisible addon messages, so nothing shows in chat).
+2. Friends make two macros from the lines. **LFG Search** checks their realm first: on your realm it
+   prints "no need to run" and stops. Otherwise it searches; 3 s later they click **LFG Send**, which
+   sends the results to you as invisible addon messages, so nothing shows in chat.
 3. You: click **Take snapshot** at about the same time. As each friend's results arrive, your chat
    prints e.g. `Thrall Doom-Realm2 (Realm2): 22 listings, 0 shared with your 14 -> merged list 36 (2.6x yours)`.
    A friend on your own realm is the control and should share almost everything.

@@ -388,7 +388,7 @@ local function onRoster(displayIndex, countArg)
   local channelName = rosterWanted[displayIndex]
   if not channelName then return end
   rosterWanted[displayIndex] = nil
-  local r = { t = now(), reported = copy(countArg), readable = 0, secret = 0, sample = {} }
+  local r = { t = now(), reported = copy(countArg), readable = 0, secret = 0, sample = {}, realms = {} }
   local n = tonumber(not isSecret(countArg) and countArg) or 0
   for i = 1, math.min(n, 500) do
     local ok, name = pcall(C_ChatInfo.GetChannelRosterInfo, displayIndex, i)
@@ -396,6 +396,11 @@ local function onRoster(displayIndex, countArg)
     elseif ok and type(name) == "string" then
       r.readable = r.readable + 1
       if #r.sample < 5 then r.sample[#r.sample + 1] = name end
+      local realm = name:match("%-([^%-]+)$") or myRealm
+      local rr = r.realms[realm] or { n = 0, names = {} }
+      rr.n = rr.n + 1
+      if #rr.names < 5 then rr.names[#rr.names + 1] = name end
+      r.realms[realm] = rr
     end
   end
   db.discovery.rosters[channelName] = r
@@ -897,7 +902,10 @@ local function macroLines()
   local t = db.target
   local ids = {}
   for _, id in ipairs(t.ids) do ids[#ids + 1] = tostring(id) end
-  local l1 = ("/run C_LFGList.Search(%d,0,0,nil,false,nil,{%s})"):format(t.cat, table.concat(ids, ","))
+  -- the realm check stops same-realm friends: they see the same list as you (measured twice)
+  local l1 = ('/run if GetNormalizedRealmName()=="%s"then print("Same realm as %s: no need to run")else '
+    .. 'C_LFGList.Search(%d,0,0,nil,false,nil,{%s})print("Searching... click LFG Send in 3 seconds")end'):format(
+    myRealm, myName, t.cat, table.concat(ids, ","))
   local l2 = ('/run local g,s,_,r=C_LFGList.GetSearchResultInfo,"",C_LFGList.GetSearchResults()for k,i in ipairs(r)do '
     .. 's=s..g(i).partyGUID:sub(7)..","if#s>200 or k==#r then C_ChatInfo.SendAddonMessage("%s","R"..#r.."^"..s,'
     .. '"WHISPER","%s")s=""end end'):format(RPREFIX, myName)
@@ -910,9 +918,10 @@ local function macros(arg)
   local l1, l2 = macroLines()
   local text = table.concat({
     "LFG realm test for " .. table.concat(db.target.names, " + ") .. " - no addon needed, takes 10 seconds:",
-    "1) Paste this into your chat box and press Enter (it searches the LFG tool):",
+    "Make two macros (/macro, New, paste the line as the body, drag to your bar).",
+    "1) LFG Search - checks your realm; if it's not " .. tostring(myRealm) .. " it searches the LFG tool:",
     l1,
-    "2) Wait 3 seconds, then paste this and press Enter (it sends the results to " .. myName .. ", invisibly):",
+    "2) LFG Send - only if LFG Search said Searching: wait 3 seconds, then click it (sends the results to " .. myName .. ", invisibly):",
     l2,
     "Must be the same faction as " .. myName .. ". Nothing shows in chat and nothing is installed.",
   }, "\n")
@@ -985,6 +994,70 @@ function snapshot(arg)
   out("click |cff33ff99Take snapshot|r (searching needs a click). Target an NPC first so your layer is included.")
 end
 
+---------------------------------------------------------------------------
+-- Realms: who around you is on ANOTHER realm (worth asking to run the macros)?
+-- Names from other realms carry a "-Realm" suffix in channel rosters, the guild roster and friends.
+---------------------------------------------------------------------------
+local function addRealm(acc, source, name)
+  if isSecret(name) or type(name) ~= "string" or name == "" then return end
+  local realm = name:match("%-([^%-]+)$") or myRealm
+  local rr = acc[realm] or { n = 0, names = {}, sources = {} }
+  rr.n = rr.n + 1
+  rr.sources[source] = true
+  if realm ~= myRealm and #rr.names < 8 and not name:find("^x%-") then rr.names[#rr.names + 1] = name .. " (" .. source .. ")" end
+  acc[realm] = rr
+end
+
+local function realmsSummary()
+  local acc = {}
+  for ch, r in pairs(db.discovery.rosters) do
+    for realm, rr in pairs(r.realms or {}) do
+      for i = 1, rr.n do addRealm(acc, ch, i <= #rr.names and rr.names[i] or ("x-" .. realm)) end
+    end
+  end
+  if IsInGuild() and GetNumGuildMembers and GetGuildRosterInfo then
+    for i = 1, GetNumGuildMembers() or 0 do addRealm(acc, "guild", (GetGuildRosterInfo(i))) end
+  end
+  if C_FriendList and C_FriendList.GetNumFriends then
+    for i = 1, C_FriendList.GetNumFriends() or 0 do
+      local info = C_FriendList.GetFriendInfoByIndex(i)
+      if info then addRealm(acc, "friends", info.name) end
+    end
+  end
+  db.realmScan = { t = now(), realms = acc }
+  local own = acc[myRealm] and acc[myRealm].n or 0
+  local others = 0
+  for realm, rr in pairs(acc) do if realm ~= myRealm then others = others + 1 end end
+  out(("realms around you: %d players on your realm (%s), %d other realm%s"):format(own, tostring(myRealm), others,
+    others == 1 and "" or "s"))
+  for realm, rr in pairs(acc) do
+    if realm ~= myRealm then
+      out(("  |cff33ff99%s|r: %d seen - e.g. %s"):format(realm, rr.n, table.concat(rr.names, ", ")))
+    end
+  end
+  if others == 0 then
+    out("  nobody from another realm in your channels, guild or friends: realms may not mix in the world. Ask in Discord, or try a city's Trade/General.")
+  else
+    out("  ask one of them (same faction) to run the macros from /probe macros <dungeon>")
+  end
+end
+
+local function realms()
+  if GetNumDisplayChannels and GetChannelDisplayInfo then
+    local names = {}
+    for i = 1, GetNumDisplayChannels() or 0 do
+      local ok, name, header = pcall(GetChannelDisplayInfo, i)
+      if ok and not header and type(name) == "string" and not isSecret(name) then names[#names + 1] = name end
+    end
+    out(("reading member lists of %d channels and your guild/friends (~%d s)..."):format(#names, 3 * #names + 3))
+    for k, name in ipairs(names) do C_Timer.After(3 * (k - 1), function() requestRoster(name) end) end
+    if C_GuildInfo and C_GuildInfo.GuildRoster then C_GuildInfo.GuildRoster() end
+    C_Timer.After(3 * #names + 3, realmsSummary)
+  else
+    realmsSummary()
+  end
+end
+
 local HELP = {
   "/probe dungeon [name|all] - list activities, or focus scans on one dungeon",
   "/probe snapshot <dungeon> - one search as copyable text, to compare realms",
@@ -993,6 +1066,7 @@ local HELP = {
   "/probe peer First Surname - add a friend for whisper tests (/probe peer clear)",
   "/probe scan - search now (slash permission)   /probe button - Scan button (click permission)",
   "/probe timerscan - search from a timer (expected to be blocked: that's the test)",
+  "/probe realms - find players on OTHER realms in your channels, guild and friends (who to ask)",
   "/probe roster - try to read member lists of our channel and General (finding users)",
   "/probe ping | burst [n] | rate <per-second> <seconds> - message route and throughput tests",
   "/probe api - LFG functions on this client   /probe report - answers   /probe reset - wipe data",
@@ -1012,6 +1086,7 @@ local function slash(input)
     perSec, secs = tonumber(perSec) or 1, tonumber(secs) or 60
     if count(db.peerTargets) == 0 then return out("add a peer first: /probe peer First Surname") end
     rateTest(math.max(0.2, math.min(perSec, 10)), math.max(5, math.min(secs, 300)))
+  elseif cmd == "realms" then realms()
   elseif cmd == "roster" then
     requestRoster(CHANNEL)
     C_Timer.After(12, function()
